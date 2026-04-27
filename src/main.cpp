@@ -1053,9 +1053,11 @@ void loop() {
     wake();
   }
 
-  // Power button (BtnPWR — Core2's bottom-left power touch zone, AXP-driven):
-  // short tap toggles screen off. Hardware long-press still triggers AXP off.
-  if (M5.BtnPWR.wasPressed()) {
+  // Toggle screen on/off — BtnC (right of the three touch zones below the
+  // LCD, the natural "screen power" affordance on Core2) or the small AXP
+  // PWR button on the left side of the case. Hardware long-press on PWR
+  // still triggers AXP power-off.
+  if (M5.BtnC.wasPressed() || M5.BtnPWR.wasPressed()) {
     if (screenOff) {
       wake();
     } else {
