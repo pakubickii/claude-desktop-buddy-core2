@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pio --version)",
+      "Read(//Users/pku/**)",
+      "Bash(command -v brew)",
+      "Bash(command -v python3)"
+    ]
+  }
+}
