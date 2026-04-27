@@ -20,7 +20,7 @@ static void startBt() {
 
 #include "character.h"
 #include "stats.h"
-const int W = 135, H = 240;
+const int W = 320, H = 240;
 const int CX = W / 2;
 const int CY_BASE = 120;
 
@@ -474,7 +474,7 @@ static void drawClock() {
       characterRenderTo(&M5.Display, 57, 45);
     }
   }
-  M5.Display.setRotation(0);
+  M5.Display.setRotation(1);   // back to default Core2 landscape after clock direct-draw
 }
 
 PersonaState derive(const TamaState& s) {
@@ -939,7 +939,7 @@ void drawHUD() {
 void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
-  M5.Display.setRotation(0);
+  M5.Display.setRotation(1);   // Core2 landscape: 320 wide × 240 tall, BtnA/B/C below LCD
   startBt();
   M5.Power.setLed(0);   // off — no-op on Core2 (no LED), pulses on boards that have one
   applyBrightness();
