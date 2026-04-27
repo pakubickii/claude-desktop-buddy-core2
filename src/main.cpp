@@ -5,7 +5,7 @@
 #include "data.h"
 #include "buddy.h"
 
-TFT_eSprite spr = TFT_eSprite(&M5.Lcd);
+M5Canvas spr(&M5.Display);
 
 // Advertise as "Claude-XXXX" (last two BT MAC bytes) so multiple sticks
 // in one room are distinguishable in the desktop picker. Name persists in
@@ -341,8 +341,8 @@ void drawMenu() {
 // on its side. Signed counter for hysteresis on both transitions — same
 // pattern as face-down nap.
 //   0 = portrait (sprite path, pet sleeps underneath)
-//   1 = landscape, BtnA-side down (M5.Lcd rotation 1)
-//   3 = landscape, USB-side down (M5.Lcd rotation 3)
+//   1 = landscape, BtnA-side down (M5.Display rotation 1)
+//   3 = landscape, USB-side down (M5.Display rotation 3)
 static uint8_t clockOrient   = 0;
 static int8_t  orientFrames  = 0;
 static uint8_t paintedOrient = 0;
@@ -432,10 +432,10 @@ static void drawClock() {
   // Landscape: 240×135 direct-to-LCD. Full fill only on entry; after that
   // text glyph bg cells repaint themselves and the pet box (small, ~90×50)
   // gets a fillRect each pet tick — small enough not to tear.
-  M5.Lcd.setRotation(clockOrient);
+  M5.Display.setRotation(clockOrient);
   static uint8_t lastSec = 0xFF;
   bool repaint = paintedOrient != clockOrient;
-  if (repaint) { M5.Lcd.fillScreen(p.bg); paintedOrient = clockOrient; lastSec = 0xFF; }
+  if (repaint) { M5.Display.fillScreen(p.bg); paintedOrient = clockOrient; lastSec = 0xFF; }
 
   // Seconds tick at 1Hz; redrawing 3 strings at 60fps is 180 SPI ops/sec
   // for nothing. Gate on the second changing (or full repaint).
@@ -443,12 +443,12 @@ static void drawClock() {
     lastSec = _clkTm.Seconds;
     char wdl[12]; snprintf(wdl, sizeof(wdl), "%s %s %02u", DOW[clockDow()], MON[mi], _clkDt.Date);
     char ssl[3]; snprintf(ssl, sizeof(ssl), "%02u", _clkTm.Seconds);
-    M5.Lcd.setTextDatum(MC_DATUM);
-    M5.Lcd.setTextSize(3); M5.Lcd.setTextColor(p.text, p.bg);    M5.Lcd.drawString(hm, 170, 42);
-    M5.Lcd.setTextSize(2); M5.Lcd.setTextColor(p.textDim, p.bg); M5.Lcd.drawString(ssl, 170, 72);
-                                                                  M5.Lcd.drawString(wdl, 170, 102);
-    M5.Lcd.setTextDatum(TL_DATUM);
-    M5.Lcd.setTextSize(1);
+    M5.Display.setTextDatum(MC_DATUM);
+    M5.Display.setTextSize(3); M5.Display.setTextColor(p.text, p.bg);    M5.Display.drawString(hm, 170, 42);
+    M5.Display.setTextSize(2); M5.Display.setTextColor(p.textDim, p.bg); M5.Display.drawString(ssl, 170, 72);
+                                                                  M5.Display.drawString(wdl, 170, 102);
+    M5.Display.setTextDatum(TL_DATUM);
+    M5.Display.setTextSize(1);
   }
 
   // Pet on left at 5 fps. Clear includes the overlay-particle zone above
@@ -462,18 +462,18 @@ static void drawClock() {
       // hardcode BUDDY_X_CENTER=67 / BUDDY_Y_OVERLAY=6 for particles so
       // keep portrait coords and just swap the surface — pet lands
       // upper-left of landscape, which is where we want it anyway.
-      M5.Lcd.fillRect(0, 0, 115, 90, p.bg);
-      buddyRenderTo(&M5.Lcd, activeState);
+      M5.Display.fillRect(0, 0, 115, 90, p.bg);
+      buddyRenderTo(&M5.Display, activeState);
     } else {
       // Full-frame GIFs paint every pixel (transparent → pal.bg), so a
       // per-tick clear just adds a visible black flash between wipe and
       // last scanline. The entry fillScreen on paintedOrient change
       // already covers the surround.
       characterSetState(activeState);
-      characterRenderTo(&M5.Lcd, 57, 45);
+      characterRenderTo(&M5.Display, 57, 45);
     }
   }
-  M5.Lcd.setRotation(0);
+  M5.Display.setRotation(0);
 }
 
 PersonaState derive(const TamaState& s) {
@@ -937,7 +937,7 @@ void drawHUD() {
 
 void setup() {
   M5.begin();
-  M5.Lcd.setRotation(0);
+  M5.Display.setRotation(0);
   M5.Imu.Init();
   M5.Beep.begin();
   startBt();

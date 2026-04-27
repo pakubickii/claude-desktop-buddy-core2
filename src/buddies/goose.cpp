@@ -3,7 +3,7 @@
 #include <M5Unified.h>
 #include <string.h>
 
-extern TFT_eSprite spr;
+extern M5Canvas spr;
 
 namespace goose {
 
