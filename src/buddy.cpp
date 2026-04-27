@@ -9,7 +9,9 @@ extern M5Canvas spr;
 enum { B_SLEEP, B_IDLE, B_BUSY, B_ATTENTION, B_CELEBRATE, B_DIZZY, B_HEART };
 
 // ──────────────── shared geometry ────────────────
-const int BUDDY_X_CENTER = 160;
+// Step 8b: pet centred in the LEFT half of the 320×240 landscape canvas
+// (clock + status sit in the right half — see drawClock in main.cpp).
+const int BUDDY_X_CENTER = 80;
 const int BUDDY_CANVAS_W = 320;
 const int BUDDY_Y_BASE   = 30;
 const int BUDDY_Y_OVERLAY = 6;

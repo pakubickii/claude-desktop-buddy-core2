@@ -419,13 +419,16 @@ static void drawClock() {
 
   if (clockOrient == 0) {
     paintedOrient = 0;
-    // Bottom half — buddy naturally lives at y=0..82, GIF peeks at top
-    // via peek mode. Clearing from 90 leaves both untouched.
-    spr.fillRect(0, 90, W, H - 90, p.bg);
+    // Core2 landscape: buddy lives in the left half (BUDDY_X_CENTER=80,
+    // see step 8b), clock lives in the right half. Clearing only the
+    // right half so the pet draw isn't fighting the clock's fillRect.
+    const int RX = W / 2;                 // 160 — right-half origin
+    const int RCX = RX + (W - RX) / 2;    // 240 — right-half center
+    spr.fillRect(RX, 0, W - RX, H, p.bg);
     spr.setTextDatum(MC_DATUM);
-    spr.setTextSize(4); spr.setTextColor(p.text, p.bg);    spr.drawString(hm, CX, 140);
-    spr.setTextSize(2); spr.setTextColor(p.textDim, p.bg); spr.drawString(ss, CX, 175);
-    spr.setTextSize(1);                                     spr.drawString(dl, CX, 200);
+    spr.setTextSize(5); spr.setTextColor(p.text, p.bg);    spr.drawString(hm, RCX, 90);
+    spr.setTextSize(2); spr.setTextColor(p.textDim, p.bg); spr.drawString(ss, RCX, 140);
+    spr.setTextSize(2);                                     spr.drawString(dl, RCX, 175);
     spr.setTextDatum(TL_DATUM);
     return;
   }
