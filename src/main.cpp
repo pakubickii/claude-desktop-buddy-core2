@@ -170,7 +170,17 @@ static void applySetting(uint8_t idx) {
     case 4: s.led = !s.led; break;
     case 5: s.hud = !s.hud; break;
     case 6: s.clockRot = (s.clockRot + 1) % 3; break;
-    case 7: s.inputMode = (s.inputMode + 1) % 2; break;
+    case 7:
+      // Mode toggle: BLE init / USB input gate is decided once at boot
+      // (see setup() and dataPoll()), so the user has to reboot for the
+      // change to actually flip transports. We save here, then schedule
+      // a restart half a second later so they see the menu confirm.
+      s.inputMode = (s.inputMode + 1) % 2;
+      settingsSave();
+      Serial.println("[setup] mode toggled — restarting to apply");
+      delay(500);
+      ESP.restart();
+      return;   // unreachable
     case 8: nextPet(); return;
     case 9: resetOpen = true; resetSel = 0; resetConfirmIdx = 0xFF; return;
     case 10: settingsOpen = false; characterInvalidate(); return;
@@ -951,15 +961,22 @@ void setup() {
   M5.begin(cfg);
   Serial.println("[setup] M5.begin done");
   M5.Display.setRotation(1);   // Core2 landscape: 320 wide × 240 tall, BtnA/B/C below LCD
-  startBt();
-  Serial.println("[setup] BLE up");
   M5.Power.setLed(0);   // off — no-op on Core2 (no LED), pulses on boards that have one
   applyBrightness();
   lastInteractMs = millis();
   statsLoad();
-  settingsLoad();
+  settingsLoad();   // need inputMode known before we decide whether to start BLE
   petNameLoad();
   buddyInit();
+  // Mutual-exclusion mode: in cli mode we don't even bring up the BLE
+  // stack, so there's no advertising for a desktop bridge to grab. In
+  // desktop mode (default) USB input is gated off in dataPoll instead.
+  if (settings().inputMode != 1) {
+    startBt();
+    Serial.println("[setup] BLE up (desktop mode)");
+  } else {
+    Serial.println("[setup] BLE skipped (cli mode — USB-only)");
+  }
 
   // BLE stays always-on; s.bt is stored as a preference only.
   spr.createSprite(W, H);

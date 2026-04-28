@@ -120,31 +120,31 @@ static void _applyJson(const char* line, TamaState* out, bool fromBle) {
     }
     out->nLines = n;
   }
-  // Prompt-field handling. CLI mode pins prompt ownership to the USB-serial
-  // transport: BLE messages still update stats/sessions/tokens but they may
-  // not set or clear promptId, so a desktop polling status with no prompt
-  // field can no longer wipe the screen out from under the relay tool.
-  bool inCliMode = (settings().inputMode == 1);
-  bool ignorePromptField = (inCliMode && fromBle);
-  if (!ignorePromptField) {
-    JsonObjectConst root = doc.as<JsonObjectConst>();
-    bool hasPromptKey = root.containsKey("prompt");
-    if (hasPromptKey) {
-      JsonVariantConst pv = doc["prompt"];
-      if (pv.is<JsonObject>()) {
-        JsonObject pr = doc["prompt"];
-        const char* pid = pr["id"]; const char* pt = pr["tool"]; const char* ph = pr["hint"];
-        strncpy(out->promptId,   pid ? pid : "", sizeof(out->promptId)-1);   out->promptId[sizeof(out->promptId)-1]=0;
-        strncpy(out->promptTool, pt  ? pt  : "", sizeof(out->promptTool)-1); out->promptTool[sizeof(out->promptTool)-1]=0;
-        strncpy(out->promptHint, ph  ? ph  : "", sizeof(out->promptHint)-1); out->promptHint[sizeof(out->promptHint)-1]=0;
-      } else {
-        // explicit null (or any non-object) clears
-        out->promptId[0] = 0; out->promptTool[0] = 0; out->promptHint[0] = 0;
-      }
+  // Prompt-field handling. The cli/desktop transport mutex is enforced
+  // upstream (cli mode skips BLE init entirely; desktop mode gates USB
+  // input in dataPoll), so by the time we get here we already know the
+  // active transport gets to set/clear promptId. The remaining nuance:
+  //   - "prompt" key absent  -> leave promptId untouched (was a footgun;
+  //     status polls used to clear the approval out from under us)
+  //   - "prompt": null       -> clear (explicit signal)
+  //   - "prompt": { id... }  -> set
+  // Local clear after a tap (main.cpp loop) handles the post-decision
+  // wipe so we don't depend on an "absent prompt key" poll any more.
+  JsonObjectConst root = doc.as<JsonObjectConst>();
+  bool hasPromptKey = root.containsKey("prompt");
+  if (hasPromptKey) {
+    JsonVariantConst pv = doc["prompt"];
+    if (pv.is<JsonObject>()) {
+      JsonObject pr = doc["prompt"];
+      const char* pid = pr["id"]; const char* pt = pr["tool"]; const char* ph = pr["hint"];
+      strncpy(out->promptId,   pid ? pid : "", sizeof(out->promptId)-1);   out->promptId[sizeof(out->promptId)-1]=0;
+      strncpy(out->promptTool, pt  ? pt  : "", sizeof(out->promptTool)-1); out->promptTool[sizeof(out->promptTool)-1]=0;
+      strncpy(out->promptHint, ph  ? ph  : "", sizeof(out->promptHint)-1); out->promptHint[sizeof(out->promptHint)-1]=0;
+    } else {
+      out->promptId[0] = 0; out->promptTool[0] = 0; out->promptHint[0] = 0;
     }
-    // hasPromptKey == false: leave promptId untouched. Status pings without
-    // a "prompt" field no longer flicker the approval screen off.
   }
+  (void)fromBle;   // kept for future per-transport routing, unused now
   out->lastUpdated = millis();
   _lastLiveMs = millis();
 }
@@ -180,7 +180,12 @@ inline void dataPoll(TamaState* out) {
     return;
   }
 
-  _usbLine.feed(Serial, out, /*fromBle=*/false);
+  // Mutual-exclusion mode: USB input is only processed in cli mode.
+  // Desktop mode keeps Serial as an output channel (boot log, [rx*]
+  // diagnostics) but ignores any JSON the host might write to it.
+  if (settings().inputMode == 1) {
+    _usbLine.feed(Serial, out, /*fromBle=*/false);
+  }
   // BLE ring buffer is drained manually since it's not a Stream.
   while (bleAvailable()) {
     int c = bleRead();
