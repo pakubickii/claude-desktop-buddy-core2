@@ -4,7 +4,17 @@
       "Bash(pio --version)",
       "Read(//Users/pku/**)",
       "Bash(command -v brew)",
-      "Bash(command -v python3)"
+      "Bash(command -v python3)",
+      "Bash(cat)",
+      "Bash(/opt/homebrew/Cellar/platformio/6.1.19_1/libexec/bin/python3 /tmp/ble_with_serial.py)",
+      "Bash(pio run *)",
+      "Bash(tools/buddy_relay --tool Bash --hint \"FIXED — tap A on Core2\" --transport ble --timeout 45)",
+      "Bash(echo \"---exit: $?---\")",
+      "Bash(ioreg -p IOUSB -l)",
+      "Bash(tools/buddy_relay --tool Bash --hint \"FIX TEST tap A\" --transport ble --timeout 30)",
+      "Bash(tools/buddy_relay --tool Bash --hint \"with msg test\" --transport ble --timeout 30)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
     ]
   }
 }

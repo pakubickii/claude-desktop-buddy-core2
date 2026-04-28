@@ -133,9 +133,13 @@ static void _applyJson(const char* line, TamaState* out, bool fromBle) {
   JsonObjectConst root = doc.as<JsonObjectConst>();
   bool hasPromptKey = root.containsKey("prompt");
   if (hasPromptKey) {
-    JsonVariantConst pv = doc["prompt"];
-    if (pv.is<JsonObject>()) {
-      JsonObject pr = doc["prompt"];
+    // ArduinoJson v7 quirk: `doc["prompt"].is<JsonObject>()` returns false
+    // even for a real object value because the JsonObject type is non-const
+    // and the variant is const here. Use the simpler "build a JsonObject and
+    // check isNull" idiom — null means either explicit JSON null or wrong
+    // type, both of which we treat as a clear request.
+    JsonObject pr = doc["prompt"];
+    if (!pr.isNull()) {
       const char* pid = pr["id"]; const char* pt = pr["tool"]; const char* ph = pr["hint"];
       strncpy(out->promptId,   pid ? pid : "", sizeof(out->promptId)-1);   out->promptId[sizeof(out->promptId)-1]=0;
       strncpy(out->promptTool, pt  ? pt  : "", sizeof(out->promptTool)-1); out->promptTool[sizeof(out->promptTool)-1]=0;

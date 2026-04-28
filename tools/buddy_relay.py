@@ -129,9 +129,40 @@ async def _relay_ble(tool: str, hint: str, timeout: float):
 
     try:
         async with BleakClient(target, timeout=10.0) as client:
-            await client.start_notify(NUS_TX_UUID, handle_notify)
-            msg = json.dumps({"prompt": {"id": pid, "tool": tool, "hint": hint[:43]}}) + "\n"
-            await client.write_gatt_char(NUS_RX_UUID, msg.encode(), response=False)
+            print("[buddy] GATT connected — discovering services…", file=sys.stderr)
+
+            # Encrypted RX/TX permissions in the firmware (see ble_bridge.cpp:
+            # ESP_GATT_PERM_*_ENCRYPTED + auth req SC_MITM_BOND) mean we must
+            # bond first. macOS doesn't expose pair() in bleak; the documented
+            # workaround is "touch an encrypted attribute and let CoreBluetooth
+            # raise the pairing UI". The CCCD on the TX characteristic is
+            # encrypted-read, so subscribing to notifications already attempts
+            # the encrypted descriptor write — usually enough on its own. We
+            # verify by surfacing any GATT error from write_gatt_char below
+            # (response=True) instead of letting a write-without-response get
+            # silently dropped on the firmware side.
+            try:
+                await client.start_notify(NUS_TX_UUID, handle_notify)
+                print("[buddy] notify subscribed", file=sys.stderr)
+            except BleakError as e:
+                print(f"[buddy] notify subscribe failed (likely pairing): {e}\n"
+                      f"        Watch the Core2 screen for a 6-digit passkey;\n"
+                      f"        macOS should prompt you to enter it.", file=sys.stderr)
+                return TRANSPORT_UNAVAILABLE
+
+            msg = json.dumps({
+                "prompt": {"id": pid, "tool": tool, "hint": hint[:43]},
+                "msg": "connected via CLI",
+            }) + "\n"
+            try:
+                await client.write_gatt_char(NUS_RX_UUID, msg.encode(), response=True)
+            except BleakError as e:
+                print(f"[buddy] write_gatt_char failed: {e}\n"
+                      f"        Encrypted-write rejection. If a passkey is on the "
+                      f"Core2 screen, enter it in the macOS prompt and rerun.",
+                      file=sys.stderr)
+                return TRANSPORT_UNAVAILABLE
+
             print(f"[buddy] prompt sent over BLE: id={pid} tool={tool!r} — "
                   f"waiting up to {timeout:.0f}s for tap on Core2", file=sys.stderr)
             try:
@@ -195,7 +226,10 @@ def _relay_usb(tool: str, hint: str, timeout: float):
         if s.in_waiting:
             s.read(s.in_waiting)
 
-        prompt_msg = json.dumps({"prompt": {"id": pid, "tool": tool, "hint": hint[:43]}})
+        prompt_msg = json.dumps({
+            "prompt": {"id": pid, "tool": tool, "hint": hint[:43]},
+            "msg": "connected via CLI",
+        })
         s.write((prompt_msg + "\n").encode()); s.flush()
         print(f"[buddy] prompt sent over USB: id={pid} tool={tool!r} — "
               f"waiting up to {timeout:.0f}s for tap on Core2", file=sys.stderr)

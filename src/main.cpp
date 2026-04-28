@@ -1053,10 +1053,17 @@ void loop() {
   // is a no-op" rule in data.h means status updates without an explicit
   // null leave promptId intact), and in cli input mode there might not
   // even be a desktop attached.
+  // CRITICAL: also reset responseSent here so a *new* prompt arriving
+  // after this clear isn't immediately wiped on the next loop iteration
+  // (we'd see promptId set, responseSent still true, time still > 1.5 s
+  // → clear before drawApproval ever ran). Found while debugging the
+  // BLE relay path.
   if (responseSent && tama.promptId[0] && millis() - responseSentMs > 1500) {
     tama.promptId[0] = 0;
     tama.promptTool[0] = 0;
     tama.promptHint[0] = 0;
+    responseSent = false;
+    lastPromptId[0] = 0;   // make the next arrival look fresh to the change-detector below
   }
 
   // BtnA: step through fake scenarios
