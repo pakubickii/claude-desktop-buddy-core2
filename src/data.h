@@ -67,8 +67,8 @@ inline const char* dataScenarioName() {
 static bool _rtcValid = false;
 inline bool dataRtcValid() { return _rtcValid; }
 
-static void _applyJson(const char* line, TamaState* out) {
-  Serial.printf("[rx] %s\n", line);   // TEMP debug
+static void _applyJson(const char* line, TamaState* out, bool fromBle) {
+  Serial.printf("[rx%c] %s\n", fromBle ? 'B' : 'U', line);   // TEMP debug
   JsonDocument doc;
   if (deserializeJson(doc, line)) { Serial.println("[rx] JSON parse FAIL"); return; }
   if (xferCommand(doc)) { _lastLiveMs = millis(); Serial.println("[rx] -> xfer cmd"); return; }
@@ -120,14 +120,30 @@ static void _applyJson(const char* line, TamaState* out) {
     }
     out->nLines = n;
   }
-  JsonObject pr = doc["prompt"];
-  if (!pr.isNull()) {
-    const char* pid = pr["id"]; const char* pt = pr["tool"]; const char* ph = pr["hint"];
-    strncpy(out->promptId,   pid ? pid : "", sizeof(out->promptId)-1);   out->promptId[sizeof(out->promptId)-1]=0;
-    strncpy(out->promptTool, pt  ? pt  : "", sizeof(out->promptTool)-1); out->promptTool[sizeof(out->promptTool)-1]=0;
-    strncpy(out->promptHint, ph  ? ph  : "", sizeof(out->promptHint)-1); out->promptHint[sizeof(out->promptHint)-1]=0;
-  } else {
-    out->promptId[0] = 0; out->promptTool[0] = 0; out->promptHint[0] = 0;
+  // Prompt-field handling. CLI mode pins prompt ownership to the USB-serial
+  // transport: BLE messages still update stats/sessions/tokens but they may
+  // not set or clear promptId, so a desktop polling status with no prompt
+  // field can no longer wipe the screen out from under the relay tool.
+  bool inCliMode = (settings().inputMode == 1);
+  bool ignorePromptField = (inCliMode && fromBle);
+  if (!ignorePromptField) {
+    JsonObjectConst root = doc.as<JsonObjectConst>();
+    bool hasPromptKey = root.containsKey("prompt");
+    if (hasPromptKey) {
+      JsonVariantConst pv = doc["prompt"];
+      if (pv.is<JsonObject>()) {
+        JsonObject pr = doc["prompt"];
+        const char* pid = pr["id"]; const char* pt = pr["tool"]; const char* ph = pr["hint"];
+        strncpy(out->promptId,   pid ? pid : "", sizeof(out->promptId)-1);   out->promptId[sizeof(out->promptId)-1]=0;
+        strncpy(out->promptTool, pt  ? pt  : "", sizeof(out->promptTool)-1); out->promptTool[sizeof(out->promptTool)-1]=0;
+        strncpy(out->promptHint, ph  ? ph  : "", sizeof(out->promptHint)-1); out->promptHint[sizeof(out->promptHint)-1]=0;
+      } else {
+        // explicit null (or any non-object) clears
+        out->promptId[0] = 0; out->promptTool[0] = 0; out->promptHint[0] = 0;
+      }
+    }
+    // hasPromptKey == false: leave promptId untouched. Status pings without
+    // a "prompt" field no longer flicker the approval screen off.
   }
   out->lastUpdated = millis();
   _lastLiveMs = millis();
@@ -137,11 +153,11 @@ template<size_t N>
 struct _LineBuf {
   char buf[N];
   uint16_t len = 0;
-  void feed(Stream& s, TamaState* out) {
+  void feed(Stream& s, TamaState* out, bool fromBle) {
     while (s.available()) {
       char c = s.read();
       if (c == '\n' || c == '\r') {
-        if (len > 0) { buf[len]=0; if (buf[0]=='{') _applyJson(buf, out); len=0; }
+        if (len > 0) { buf[len]=0; if (buf[0]=='{') _applyJson(buf, out, fromBle); len=0; }
       } else if (len < N-1) {
         buf[len++] = c;
       }
@@ -164,7 +180,7 @@ inline void dataPoll(TamaState* out) {
     return;
   }
 
-  _usbLine.feed(Serial, out);
+  _usbLine.feed(Serial, out, /*fromBle=*/false);
   // BLE ring buffer is drained manually since it's not a Stream.
   while (bleAvailable()) {
     int c = bleRead();
@@ -173,7 +189,7 @@ inline void dataPoll(TamaState* out) {
     if (c == '\n' || c == '\r') {
       if (_btLine.len > 0) {
         _btLine.buf[_btLine.len] = 0;
-        if (_btLine.buf[0] == '{') _applyJson(_btLine.buf, out);
+        if (_btLine.buf[0] == '{') _applyJson(_btLine.buf, out, /*fromBle=*/true);
         _btLine.len = 0;
       }
     } else if (_btLine.len < sizeof(_btLine.buf) - 1) {
