@@ -1,5 +1,20 @@
 # Port `claude-desktop-buddy` ze StickC Plus na M5Stack Core2
 
+## Git workflow — git-flow
+
+Repo używa git-flow. Reguły dla agenta i dla człowieka:
+
+- **`main`** — tylko stan release-ready. Każdy merge na `main` reprezentuje wersję którą da się zflashować i używać. Tag-uje się release'y (np. `v0.1-core2-mvp`).
+- **`develop`** — integracja codziennej pracy. Domyślny branch dla każdej zmiany która nie jest hotfixem.
+- **`feature/<krótki-opis>`** — pojedynczy feature lub krok migracji. Branchowane z `develop`, mergowane z powrotem do `develop` przez PR (squash albo merge commit — do uzgodnienia per zmiana).
+- **`release/<wersja>`** — przygotowanie konkretnego release'u (bump wersji, changelog, ostatnie testy). Branchowane z `develop`, po zakończeniu mergowane do `main` (z tagiem) i do `develop`.
+- **`hotfix/<krótki-opis>`** — pilna poprawka stanu produkcyjnego. Branchowana z `main`, mergowana do `main` + `develop`.
+
+**Reguły żelazne:**
+- Nie commituj bezpośrednio na `main` ani na `develop`. Zawsze przez `feature/`, `release/` lub `hotfix/` branch i PR.
+- Commit message: imperatyw, krótki tytuł (≤70 znaków). W body wyjaśnij **co i dlaczego**, nie *jak* (jak widać w diff). Wzorzec — historia migracji StickC→Core2 (commity `Step 1`–`Step 8b`).
+- Branch z `feature/` po mergu kasować (`git push origin --delete feature/foo`).
+
 ## Cel
 
 Sportować firmware z [anthropics/claude-desktop-buddy](https://github.com/anthropics/claude-desktop-buddy) z M5StickC Plus (ESP32 + 135×240 portrait + 2 fizyczne przyciski) na **M5Stack Core2** (ESP32 + 320×240 landscape + dotykowy ekran + IMU + głośnik + RTC + bateria), zachowując pełną funkcjonalność: BLE bridge, 18 ASCII pets z 7 animacjami każdy, GIF packs, state machine, wszystkie ekrany (Normal/Pet/Info/Approval/Menu).
