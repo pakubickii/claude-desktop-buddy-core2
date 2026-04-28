@@ -38,8 +38,10 @@ Override the auto-detected port with `BUDDY_PORT=/dev/cu.wchusbserialXYZ`.
 
 ## Wire it into Claude Code as a `PreToolUse` hook
 
-Once the standalone test works, add this to either the project's
-`.claude/settings.json` or your user-global `~/.claude/settings.json`:
+Once the standalone test works, copy the block from
+[`.claude/settings.example.json`](../.claude/settings.example.json)
+into either the project's `.claude/settings.json` or your user-global
+`~/.claude/settings.json` and restart Claude Code.
 
 ```json
 {
@@ -50,7 +52,8 @@ Once the standalone test works, add this to either the project's
         "hooks": [
           {
             "type": "command",
-            "command": "/absolute/path/to/repo/tools/buddy_relay"
+            "command": "$CLAUDE_PROJECT_DIR/tools/buddy_relay",
+            "timeout": 90
           }
         ]
       }
@@ -58,6 +61,11 @@ Once the standalone test works, add this to either the project's
   }
 }
 ```
+
+`$CLAUDE_PROJECT_DIR` is set by Claude Code to the repo root; for a
+user-global config, replace with the absolute path. The 90 s `timeout`
+matches `buddy_relay`'s default 60 s decision window with headroom for
+the boot-settle delay.
 
 When Claude Code is about to run a matching tool it pipes the tool-call
 metadata to the script on stdin; the script forwards it to the buddy,
