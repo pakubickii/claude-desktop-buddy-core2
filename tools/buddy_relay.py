@@ -336,14 +336,25 @@ def main() -> int:
     if hooked:
         tool, hint = hooked
         rc = relay(tool, hint, args.timeout, args.transport)
-        if rc == 0:
-            print(json.dumps({"permissionDecision": "allow",
-                              "permissionDecisionReason": "buddy approved"}))
-        else:
-            print(json.dumps({"permissionDecision": "deny",
-                              "permissionDecisionReason": "buddy denied or timed out"}),
-                  file=sys.stderr)
-        return rc
+        # Claude Code PreToolUse hook contract (current): emit JSON on stdout
+        # with hookSpecificOutput wrapping permissionDecision. Flat
+        # {"permissionDecision":"allow"} at root is the *deprecated* shape and
+        # is silently ignored — Claude Code falls back to its own terminal
+        # prompt, which is what the user saw.
+        out = {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow" if rc == 0 else "deny",
+                "permissionDecisionReason": "buddy approved" if rc == 0
+                    else "buddy denied or timed out",
+            }
+        }
+        print(json.dumps(out))
+        # Always exit 0 when we have a decision to communicate — non-zero
+        # exit codes are reserved for "hook failed", which would surface as
+        # an error to the user instead of routing the deny back as a
+        # permission decision.
+        return 0
 
     ap.print_help(sys.stderr)
     return 2

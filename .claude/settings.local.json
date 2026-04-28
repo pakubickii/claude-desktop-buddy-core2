@@ -14,7 +14,9 @@
       "Bash(tools/buddy_relay --tool Bash --hint \"FIX TEST tap A\" --transport ble --timeout 30)",
       "Bash(tools/buddy_relay --tool Bash --hint \"with msg test\" --transport ble --timeout 30)",
       "Bash(git add *)",
-      "Bash(git commit -m ' *)"
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(tools/buddy_relay --tool Bash --hint \"BLE only — no cable, tap A\" --timeout 30)"
     ]
   }
 }
