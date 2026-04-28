@@ -295,13 +295,28 @@ def relay(tool: str, hint: str, timeout: float, transport: str) -> int:
 
 # ───────────────────────────── hook integration ──────────────────────────
 
-def from_hook_stdin() -> tuple[str, str] | None:
-    """Read a Claude Code PreToolUse hook payload from stdin (if any)."""
+def from_hook_stdin() -> tuple[str, str, str] | None:
+    """Read a Claude Code PreToolUse hook payload from stdin (if any).
+
+    Returns (tool, hint, permission_mode). permission_mode is "" if the
+    payload predates the field (older Claude Code) — caller treats unknown
+    as "fall back to env-var bypass / default to relay".
+    """
     if sys.stdin.isatty():
         return None
     raw = sys.stdin.read().strip()
     if not raw:
         return None
+    # Diagnostic: dump raw stdin to a file when BUDDY_RELAY_DEBUG_DUMP is set.
+    # Used once to discover what fields Claude Code actually passes (e.g.
+    # permission_mode). Left in tree as a self-service trace switch.
+    dump = os.environ.get("BUDDY_RELAY_DEBUG_DUMP")
+    if dump:
+        try:
+            with open(dump, "a") as fh:
+                fh.write(raw + "\n")
+        except OSError:
+            pass
     try:
         doc = json.loads(raw)
     except json.JSONDecodeError:
@@ -315,7 +330,15 @@ def from_hook_stdin() -> tuple[str, str] | None:
         or ti.get("path")
         or json.dumps(ti)[:200]
     )
-    return str(tool), str(hint)
+    mode = doc.get("permission_mode") or ""
+    return str(tool), str(hint), str(mode)
+
+
+# Permission modes where Claude Code is *already* running autonomously and
+# the user has explicitly opted out of the per-action confirmation loop.
+# Relaying these to the buddy would defeat the point of those modes — every
+# tool would block on a hardware tap. Instead we silently allow.
+_BYPASS_MODES = {"auto", "bypassPermissions", "dontAsk"}
 
 
 def main() -> int:
@@ -334,7 +357,33 @@ def main() -> int:
 
     hooked = from_hook_stdin()
     if hooked:
-        tool, hint = hooked
+        tool, hint, mode = hooked
+        # Mode-aware bypass. Claude Code 1.x sends permission_mode in the
+        # PreToolUse payload; we use it to decide whether the user wants
+        # per-action approval (relay) or has opted into autonomous flow
+        # (bypass). Two env-var overrides on top:
+        #
+        #   BUDDY_RELAY_DISABLED=1   → always bypass (e.g. CI, scripted runs)
+        #   BUDDY_RELAY_FORCE=1      → always relay (override auto mode for
+        #                              a buddy-hardware demo session)
+        #
+        # Older Claude Code that doesn't send permission_mode falls through
+        # to the historical default: relay everything. That keeps the
+        # hook's behaviour conservative on outdated installs.
+        force_off = os.environ.get("BUDDY_RELAY_DISABLED") == "1"
+        force_on  = os.environ.get("BUDDY_RELAY_FORCE") == "1"
+        bypass = force_off or (mode in _BYPASS_MODES and not force_on)
+        if bypass:
+            why = ("BUDDY_RELAY_DISABLED=1" if force_off
+                   else f"permission_mode={mode!r}")
+            print(json.dumps({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "permissionDecisionReason": f"buddy bypass: {why}",
+                }
+            }))
+            return 0
         rc = relay(tool, hint, args.timeout, args.transport)
         # Claude Code PreToolUse hook contract (current): emit JSON on stdout
         # with hookSpecificOutput wrapping permissionDecision. Flat
