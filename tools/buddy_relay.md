@@ -11,13 +11,19 @@ just like the desktop does over BLE.
 
 - Buddy plugged into the host via USB-C (CH9102 driver loaded — you
   should see `/dev/cu.wchusbserial*`).
-- `pyserial` (`pip install pyserial`).
-- Python 3.10+.
+- A Python 3.10+ interpreter with `pyserial` available somewhere on the
+  machine. The launcher (`tools/buddy_relay`) auto-discovers a usable
+  one — PlatformIO's bundled Python ships with `pyserial` so just
+  having PIO installed is enough.
+- If neither PlatformIO nor any system Python has `pyserial`:
+  `pipx install pyserial && pipx ensurepath`, or
+  `pip3 install --user --break-system-packages pyserial`, or set
+  `BUDDY_PYTHON=/path/to/python` to override discovery.
 
 ## Standalone test (do this first)
 
 ```bash
-python3 tools/buddy_relay.py --tool Bash --hint "ls /tmp"
+tools/buddy_relay --tool Bash --hint "ls /tmp"
 ```
 
 Watch the Core2: an APPROVAL screen with id, tool name, and hint should
@@ -44,7 +50,7 @@ Once the standalone test works, add this to either the project's
         "hooks": [
           {
             "type": "command",
-            "command": "python3 /absolute/path/to/repo/tools/buddy_relay.py"
+            "command": "/absolute/path/to/repo/tools/buddy_relay"
           }
         ]
       }
