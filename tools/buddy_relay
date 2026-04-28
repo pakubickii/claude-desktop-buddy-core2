@@ -10,7 +10,11 @@ set -euo pipefail
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 TARGET="$SCRIPT_DIR/buddy_relay.py"
 
-has_pyserial() { "$1" -c "import serial" >/dev/null 2>&1; }
+# Either transport library is enough — buddy_relay.py picks one at
+# runtime based on what it can import and what device it can reach.
+has_relay_lib() {
+  "$1" -c "import bleak" >/dev/null 2>&1 || "$1" -c "import serial" >/dev/null 2>&1
+}
 
 # Build candidate list. Globs may not match — `compgen -G` skips empties.
 CANDIDATES=()
@@ -21,16 +25,16 @@ while IFS= read -r p; do CANDIDATES+=("$p"); done < <(compgen -G "/opt/homebrew/
 CANDIDATES+=("python3")
 
 for py in "${CANDIDATES[@]}"; do
-  if command -v "$py" >/dev/null 2>&1 && has_pyserial "$py"; then
+  if command -v "$py" >/dev/null 2>&1 && has_relay_lib "$py"; then
     exec "$py" "$TARGET" "$@"
   fi
 done
 
 cat >&2 <<'EOF'
-[buddy] No Python with pyserial found. Install one of:
-  pipx install pyserial && pipx ensurepath
-  pip3 install --user --break-system-packages pyserial
-or point BUDDY_PYTHON at a Python interpreter that already has pyserial:
+[buddy] No Python with bleak or pyserial found. Install at least one:
+  bleak  (BLE transport, recommended): pipx install bleak
+  pyserial (USB transport, fallback):  pipx install pyserial
+or point BUDDY_PYTHON at a Python interpreter that already has one:
   BUDDY_PYTHON=$(which python3) tools/buddy_relay --tool Bash --hint test
 EOF
 exit 1

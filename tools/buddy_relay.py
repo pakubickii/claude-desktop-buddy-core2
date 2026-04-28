@@ -1,33 +1,39 @@
 #!/usr/bin/env python3
 """buddy_relay.py — bridge a single permission decision from Claude Code CLI
-to a USB-attached claude-desktop-buddy device.
+to a claude-desktop-buddy device, over either BLE or USB serial.
 
-The standalone `claude` CLI doesn't talk to the Claude Desktop Hardware
-Buddy bridge. This script fills the gap by writing the same line-based
-JSON protocol the desktop speaks over BLE, but on the buddy's USB serial
-port — the firmware accepts both transports interchangeably.
+Two transports, picked in this order by default:
 
-Usage as a standalone tester:
+1. **BLE** (preferred when no cable). Scans for `Claude-*` advertising
+   the Nordic UART Service, connects, writes the prompt, listens for
+   the permission response on the TX characteristic. Requires `bleak`.
+   Fights for the same single-central slot the Claude Desktop Hardware
+   Buddy uses — disconnect that panel before running CLI relay or it
+   won't get the slot.
 
-    python3 tools/buddy_relay.py --tool Bash --hint "ls /tmp"
+2. **USB serial** (fallback / explicit). Same line-JSON protocol on
+   `/dev/cu.wchusbserial*`. Requires `pyserial` and the buddy
+   firmware to be in cli mode (settings → input mode → cli).
 
-The script blocks until the user taps BtnA (approve) or BtnB (deny) on the
-device, then exits 0 / 2 accordingly.
+Override with `--transport ble|usb|auto` or `BUDDY_TRANSPORT=ble|usb|auto`.
 
-Usage as a Claude Code PreToolUse hook (see tools/buddy_relay.md):
+Standalone test:
 
-    .claude/settings.json wires this script into PreToolUse for tools you
-    want gated through the buddy. The hook contract: exit 0 with a JSON
-    permissionDecision on stdout, or exit 2 to block.
+    tools/buddy_relay --tool Bash --hint "ls /tmp"
 
-Port discovery: BUDDY_PORT env var wins; otherwise the first
-/dev/cu.wchusbserial* (or /dev/cu.usbserial*) device is used. If nothing
-matches, the script exits 0 silently — i.e. it falls back to Claude
-Code's default permission flow rather than blocking work when the buddy
-is unplugged.
+PreToolUse hook (Claude Code stdin payload, see tools/buddy_relay.md):
+
+    .claude/settings.json wires this script into PreToolUse for the
+    tools you want gated through the buddy. Returns
+    {"permissionDecision":"allow"} on tap A, "deny" on tap B / timeout.
+
+If neither transport finds a device, exits 0 silently — Claude Code
+falls back to its built-in terminal prompt rather than blocking work
+when the buddy is unreachable.
 """
 
 import argparse
+import asyncio
 import glob
 import json
 import os
@@ -38,74 +44,162 @@ import uuid
 DEFAULT_TIMEOUT_S = 60
 DEFAULT_BAUD = 115200
 
+NUS_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+NUS_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 
-def find_port() -> str | None:
-    """Return the buddy's serial device path, or None if not connected."""
+# Sentinel returned by transport functions when they can't reach the
+# device (lib missing, no scan match, port absent…). Distinct from
+# None which we use elsewhere — caller falls through to next transport.
+TRANSPORT_UNAVAILABLE = "transport_unavailable"
+
+
+# ───────────────────────────── BLE transport ─────────────────────────────
+
+async def _relay_ble(tool: str, hint: str, timeout: float):
+    """Send the prompt over BLE via the Nordic UART Service.
+
+    Returns 0 / 2 on a real decision, TRANSPORT_UNAVAILABLE if BLE
+    couldn't even be attempted (bleak missing, no advertiser found,
+    connection refused).
+    """
+    try:
+        from bleak import BleakScanner, BleakClient
+        from bleak.exc import BleakError
+    except ImportError:
+        print("[buddy] bleak not installed — skipping BLE attempt. "
+              "Install with: pipx install bleak", file=sys.stderr)
+        return TRANSPORT_UNAVAILABLE
+
+    name_prefix = os.environ.get("BUDDY_NAME_PREFIX", "Claude-")
+    pinned_name = os.environ.get("BUDDY_BLE_NAME")
+    pinned_addr = os.environ.get("BUDDY_BLE_ADDR")
+    scan_s = float(os.environ.get("BUDDY_BLE_SCAN_S", "3"))
+
+    print(f"[buddy] scanning BLE for '{name_prefix}*' ({scan_s:.1f} s)…",
+          file=sys.stderr)
+    try:
+        devices = await BleakScanner.discover(timeout=scan_s)
+    except BleakError as e:
+        print(f"[buddy] BLE scan failed: {e} — skipping", file=sys.stderr)
+        return TRANSPORT_UNAVAILABLE
+
+    target = None
+    for d in devices:
+        if pinned_addr and d.address.lower() == pinned_addr.lower():
+            target = d; break
+        if pinned_name and d.name == pinned_name:
+            target = d; break
+        if not pinned_addr and not pinned_name and d.name and d.name.startswith(name_prefix):
+            target = d; break
+    if not target:
+        print(f"[buddy] no '{name_prefix}*' device advertising — "
+              f"is something else (Hardware Buddy?) holding the BLE slot?",
+              file=sys.stderr)
+        return TRANSPORT_UNAVAILABLE
+
+    print(f"[buddy] connecting to {target.name} ({target.address})…",
+          file=sys.stderr)
+
+    pid = uuid.uuid4().hex[:12]
+    decision_future: asyncio.Future = asyncio.Future()
+    line_buf = bytearray()
+
+    def handle_notify(_handle, data: bytearray):
+        line_buf.extend(data)
+        while True:
+            for sep in (b"\n", b"\r"):
+                idx = line_buf.find(sep)
+                if idx >= 0:
+                    break
+            else:
+                idx = -1
+            if idx < 0:
+                return
+            line = bytes(line_buf[:idx]).strip()
+            del line_buf[:idx + 1]
+            if not line.startswith(b"{"):
+                continue
+            try:
+                doc = json.loads(line.decode("utf-8", errors="replace"))
+            except json.JSONDecodeError:
+                continue
+            if doc.get("cmd") == "permission" and doc.get("id") == pid:
+                if not decision_future.done():
+                    decision_future.set_result(doc.get("decision", "deny"))
+
+    try:
+        async with BleakClient(target, timeout=10.0) as client:
+            await client.start_notify(NUS_TX_UUID, handle_notify)
+            msg = json.dumps({"prompt": {"id": pid, "tool": tool, "hint": hint[:43]}}) + "\n"
+            await client.write_gatt_char(NUS_RX_UUID, msg.encode(), response=False)
+            print(f"[buddy] prompt sent over BLE: id={pid} tool={tool!r} — "
+                  f"waiting up to {timeout:.0f}s for tap on Core2", file=sys.stderr)
+            try:
+                decision = await asyncio.wait_for(decision_future, timeout=timeout)
+                print(f"[buddy] decision: {decision}", file=sys.stderr)
+                return 0 if decision in ("once", "always") else 2
+            except asyncio.TimeoutError:
+                print(f"[buddy] BLE timeout after {timeout:.0f}s — denying.",
+                      file=sys.stderr)
+                return 2
+    except BleakError as e:
+        print(f"[buddy] BLE connection failed: {e} — skipping", file=sys.stderr)
+        return TRANSPORT_UNAVAILABLE
+
+
+# ───────────────────────────── USB transport ─────────────────────────────
+
+def _find_usb_port() -> str | None:
     if (env := os.environ.get("BUDDY_PORT")):
         return env
-    for pattern in ("/dev/cu.wchusbserial*", "/dev/cu.usbserial*", "/dev/ttyUSB*", "/dev/ttyACM*"):
+    for pattern in ("/dev/cu.wchusbserial*", "/dev/cu.usbserial*",
+                    "/dev/ttyUSB*", "/dev/ttyACM*"):
         hits = sorted(glob.glob(pattern))
         if hits:
             return hits[0]
     return None
 
 
-def relay(tool: str, hint: str, timeout: float = DEFAULT_TIMEOUT_S) -> int:
-    """Send a permission prompt to the buddy and wait for the user's tap.
-
-    Returns:
-        0  — user approved (decision == "once" or "always")
-        2  — user denied, request timed out, or pyserial / port error
-    """
+def _relay_usb(tool: str, hint: str, timeout: float):
     try:
-        import serial  # lazy: only required when a buddy is actually attached
+        import serial
     except ImportError:
-        print("[buddy] pyserial not installed; install via 'pip install pyserial'. "
-              "Falling back to default permission flow.", file=sys.stderr)
-        return 0
+        print("[buddy] pyserial not installed — skipping USB attempt. "
+              "Install with: pipx install pyserial", file=sys.stderr)
+        return TRANSPORT_UNAVAILABLE
 
-    port = find_port()
+    port = _find_usb_port()
     if not port:
-        print("[buddy] no serial device found — falling back to default "
-              "permission flow.", file=sys.stderr)
-        return 0
+        print("[buddy] no USB serial device — skipping USB attempt",
+              file=sys.stderr)
+        return TRANSPORT_UNAVAILABLE
 
     pid = uuid.uuid4().hex[:12]
     s = serial.Serial()
     s.port = port
     s.baudrate = DEFAULT_BAUD
     s.timeout = 0.2
-    s.dtr = False  # never reset the ESP32 on open
+    s.dtr = False
     s.rts = False
     try:
         s.open()
     except serial.SerialException as e:
-        print(f"[buddy] cannot open {port}: {e} — falling back.", file=sys.stderr)
-        return 0
+        print(f"[buddy] cannot open {port}: {e} — skipping", file=sys.stderr)
+        return TRANSPORT_UNAVAILABLE
 
     try:
-        # macOS + CH9102 quirk: opening the port asserts DTR/RTS just long
-        # enough to pull the ESP32 EN line low and trigger a reset, even
-        # when pyserial's dtr/rts attributes are False before open(). We
-        # can't avoid that; we can only wait the boot out before writing,
-        # otherwise the prompt lands in a UART buffer that boot wipes.
-        # 2.5 s is safe — bootloader+app on Core2 settles in ~1.5 s.
+        # See module docstring / earlier commits — opening the port
+        # toggles DTR briefly, resetting the ESP32. Wait for boot before
+        # writing or the prompt lands in a buffer that boot wipes.
         time.sleep(2.5)
         if s.in_waiting:
-            s.read(s.in_waiting)   # discard boot log + early NVS/FS errors
+            s.read(s.in_waiting)
 
-        # Truncate hint to fit the firmware's 43-char buffer (data.h:21)
         prompt_msg = json.dumps({"prompt": {"id": pid, "tool": tool, "hint": hint[:43]}})
-        s.write((prompt_msg + "\n").encode())
-        s.flush()
+        s.write((prompt_msg + "\n").encode()); s.flush()
+        print(f"[buddy] prompt sent over USB: id={pid} tool={tool!r} — "
+              f"waiting up to {timeout:.0f}s for tap on Core2", file=sys.stderr)
 
-        print(f"[buddy] prompt sent: id={pid} tool={tool!r} — waiting up to "
-              f"{timeout:.0f}s for tap on Core2 (BtnA=approve, BtnB=deny)",
-              file=sys.stderr)
-
-        # The buddy retransmit-loop: every ~1s push the prompt again so a
-        # parallel BLE poll from a connected desktop (which clears promptId
-        # on every status message that lacks "prompt") can't wipe it.
         end = time.time() + timeout
         last_resend = time.time()
         buf = b""
@@ -126,30 +220,49 @@ def relay(tool: str, hint: str, timeout: float = DEFAULT_TIMEOUT_S) -> int:
                         decision = doc.get("decision", "deny")
                         print(f"[buddy] decision: {decision}", file=sys.stderr)
                         return 0 if decision in ("once", "always") else 2
-
             if time.time() - last_resend > 1.0:
-                s.write((prompt_msg + "\n").encode())
-                s.flush()
+                s.write((prompt_msg + "\n").encode()); s.flush()
                 last_resend = time.time()
-
-        print(f"[buddy] timeout after {timeout:.0f}s — denying.", file=sys.stderr)
+        print(f"[buddy] USB timeout after {timeout:.0f}s — denying.",
+              file=sys.stderr)
         return 2
     finally:
-        try:
-            s.close()
-        except Exception:
-            pass
+        try: s.close()
+        except Exception: pass
 
+
+# ───────────────────────────── transport picker ──────────────────────────
+
+def _resolve_transport(arg: str | None) -> str:
+    return (arg or os.environ.get("BUDDY_TRANSPORT") or "auto").lower()
+
+
+def relay(tool: str, hint: str, timeout: float, transport: str) -> int:
+    transport = _resolve_transport(transport)
+    if transport == "ble":
+        rc = asyncio.run(_relay_ble(tool, hint, timeout))
+        return 0 if rc is TRANSPORT_UNAVAILABLE else rc
+    if transport == "usb":
+        rc = _relay_usb(tool, hint, timeout)
+        return 0 if rc is TRANSPORT_UNAVAILABLE else rc
+    # auto: try BLE first, USB second. Either failing to "find a device"
+    # falls through; either reaching the device and getting a real
+    # decision (or a real timeout) wins.
+    rc = asyncio.run(_relay_ble(tool, hint, timeout))
+    if rc is not TRANSPORT_UNAVAILABLE:
+        return rc
+    rc = _relay_usb(tool, hint, timeout)
+    if rc is not TRANSPORT_UNAVAILABLE:
+        return rc
+    print("[buddy] no transport reached the device — falling back to "
+          "Claude Code's default permission flow.", file=sys.stderr)
+    return 0
+
+
+# ───────────────────────────── hook integration ──────────────────────────
 
 def from_hook_stdin() -> tuple[str, str] | None:
-    """Try to read a Claude Code PreToolUse hook payload from stdin.
-
-    Claude Code feeds hook scripts a JSON object on stdin describing the
-    tool call. Shape (per current docs):
-        {"hook_event_name": "PreToolUse", "tool_name": "Bash",
-         "tool_input": {"command": "...", "description": "..."}}
-    Returns (tool, hint) or None if stdin doesn't carry a valid payload.
-    """
+    """Read a Claude Code PreToolUse hook payload from stdin (if any)."""
     if sys.stdin.isatty():
         return None
     raw = sys.stdin.read().strip()
@@ -161,7 +274,6 @@ def from_hook_stdin() -> tuple[str, str] | None:
         return None
     tool = doc.get("tool_name") or doc.get("tool") or "unknown"
     ti = doc.get("tool_input") or {}
-    # Pick the most "showable" field per tool — falls back to a JSON snippet
     hint = (
         ti.get("command")
         or ti.get("description")
@@ -173,22 +285,23 @@ def from_hook_stdin() -> tuple[str, str] | None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Relay a Claude Code permission decision to a USB-attached buddy.")
+    ap = argparse.ArgumentParser(description="Relay a Claude Code permission decision to a claude-desktop-buddy device.")
     ap.add_argument("--tool", help="Tool name shown on the buddy (e.g. Bash, Write).")
     ap.add_argument("--hint", help="Short hint text shown on the buddy.")
     ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S,
                     help=f"Seconds to wait for a tap before denying (default: {DEFAULT_TIMEOUT_S}).")
+    ap.add_argument("--transport", choices=("auto", "ble", "usb"), default=None,
+                    help="Override transport. Defaults to auto (BLE first, USB fallback). "
+                         "Also reads BUDDY_TRANSPORT env.")
     args = ap.parse_args()
 
     if args.tool and args.hint:
-        return relay(args.tool, args.hint, args.timeout)
+        return relay(args.tool, args.hint, args.timeout, args.transport)
 
     hooked = from_hook_stdin()
     if hooked:
         tool, hint = hooked
-        rc = relay(tool, hint, args.timeout)
-        # Claude Code hook contract: emit a JSON permissionDecision so the
-        # main loop knows whether to bypass its own permission check.
+        rc = relay(tool, hint, args.timeout, args.transport)
         if rc == 0:
             print(json.dumps({"permissionDecision": "allow",
                               "permissionDecisionReason": "buddy approved"}))

@@ -968,15 +968,16 @@ void setup() {
   settingsLoad();   // need inputMode known before we decide whether to start BLE
   petNameLoad();
   buddyInit();
-  // Mutual-exclusion mode: in cli mode we don't even bring up the BLE
-  // stack, so there's no advertising for a desktop bridge to grab. In
-  // desktop mode (default) USB input is gated off in dataPoll instead.
-  if (settings().inputMode != 1) {
-    startBt();
-    Serial.println("[setup] BLE up (desktop mode)");
-  } else {
-    Serial.println("[setup] BLE skipped (cli mode — USB-only)");
-  }
+  // BLE is always on. The Nordic UART Service is the universal entry
+  // point — Hardware Buddy in Desktop, the buddy_relay BLE path, or any
+  // third-party integration all attach here. BLE GATT's single-central
+  // rule gives us a natural runtime mutex for "who owns the prompt
+  // screen right now". The settings.inputMode toggle below only governs
+  // the *additional* USB-input transport, not BLE.
+  startBt();
+  Serial.println(settings().inputMode == 1
+                   ? "[setup] BLE up (cli mode — USB input also accepted)"
+                   : "[setup] BLE up (desktop mode — USB input ignored)");
 
   // BLE stays always-on; s.bt is stored as a preference only.
   spr.createSprite(W, H);
