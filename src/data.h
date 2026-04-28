@@ -68,9 +68,10 @@ static bool _rtcValid = false;
 inline bool dataRtcValid() { return _rtcValid; }
 
 static void _applyJson(const char* line, TamaState* out) {
+  Serial.printf("[rx] %s\n", line);   // TEMP debug
   JsonDocument doc;
-  if (deserializeJson(doc, line)) return;
-  if (xferCommand(doc)) { _lastLiveMs = millis(); return; }
+  if (deserializeJson(doc, line)) { Serial.println("[rx] JSON parse FAIL"); return; }
+  if (xferCommand(doc)) { _lastLiveMs = millis(); Serial.println("[rx] -> xfer cmd"); return; }
 
   // Bridge sends {"time":[epoch_sec, tz_offset_sec]}; gmtime_r on the
   // adjusted epoch yields local components including weekday.

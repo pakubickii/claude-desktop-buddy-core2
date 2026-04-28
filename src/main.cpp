@@ -940,10 +940,15 @@ void drawHUD() {
 }
 
 void setup() {
+  Serial.begin(115200);
+  delay(50);
+  Serial.println("[setup] entered");
   auto cfg = M5.config();
   M5.begin(cfg);
+  Serial.println("[setup] M5.begin done");
   M5.Display.setRotation(1);   // Core2 landscape: 320 wide × 240 tall, BtnA/B/C below LCD
   startBt();
+  Serial.println("[setup] BLE up");
   M5.Power.setLed(0);   // off — no-op on Core2 (no LED), pulses on boards that have one
   applyBrightness();
   lastInteractMs = millis();

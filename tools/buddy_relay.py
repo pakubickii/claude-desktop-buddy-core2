@@ -84,9 +84,15 @@ def relay(tool: str, hint: str, timeout: float = DEFAULT_TIMEOUT_S) -> int:
         return 0
 
     try:
-        # Drop any stale bytes the firmware printed before we attached
+        # macOS + CH9102 quirk: opening the port asserts DTR/RTS just long
+        # enough to pull the ESP32 EN line low and trigger a reset, even
+        # when pyserial's dtr/rts attributes are False before open(). We
+        # can't avoid that; we can only wait the boot out before writing,
+        # otherwise the prompt lands in a UART buffer that boot wipes.
+        # 2.5 s is safe — bootloader+app on Core2 settles in ~1.5 s.
+        time.sleep(2.5)
         if s.in_waiting:
-            s.read(s.in_waiting)
+            s.read(s.in_waiting)   # discard boot log + early NVS/FS errors
 
         # Truncate hint to fit the firmware's 43-char buffer (data.h:21)
         prompt_msg = json.dumps({"prompt": {"id": pid, "tool": tool, "hint": hint[:43]}})
