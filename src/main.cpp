@@ -20,6 +20,7 @@ static void startBt() {
 
 #include "character.h"
 #include "stats.h"
+#include "quotes.h"
 const int W = 320, H = 240;
 const int CX = W / 2;
 const int CY_BASE = 120;
@@ -42,6 +43,28 @@ uint32_t     oneShotUntil = 0;
 // past the deadline" so wraparound after ~49 days doesn't matter.
 uint32_t     vibrateUntil = 0;
 uint32_t     lastShakeCheck = 0;
+
+// Speech-bubble quote state. activeQuote points into either the local
+// QUOTES[] pool (Phase A) or a small RAM buffer that holds whatever the
+// bridge most recently pushed via {"quote":"..."} (Phase B, see
+// data.h). quoteShownAt drives the on-screen TTL; quoteHideAt is the
+// computed deadline (so we can word-wrap once and not re-measure). The
+// bridge-pushed text lives in bridgeQuoteBuf so the picker code can
+// just store a pointer regardless of source.
+const uint32_t QUOTE_TTL_MS    = 5500;            // how long a bubble stays up
+const uint32_t QUOTE_MIN_GAP_MS = 3 * 60 * 1000;  // earliest next local quote
+const uint32_t QUOTE_MAX_GAP_MS = 8 * 60 * 1000;  // latest next local quote
+// First quote uses a tighter window so a freshly booted device gets to
+// say something within a minute — otherwise the feature feels broken
+// during first-impression testing.
+const uint32_t QUOTE_FIRST_MIN_MS = 30 * 1000;
+const uint32_t QUOTE_FIRST_MAX_MS = 75 * 1000;
+char         bridgeQuoteBuf[64] = "";
+uint32_t     bridgeQuoteSeenAt  = 0;     // last consumed bridge quote arrival ms
+const char*  activeQuote        = nullptr;
+uint32_t     quoteShownAt       = 0;
+uint32_t     nextLocalQuoteAt   = 0;
+int16_t      lastQuoteIdx       = -1;    // avoid back-to-back duplicates
 float        accelBaseline = 1.0f;
 unsigned long t = 0;
 
@@ -149,10 +172,11 @@ bool    settingsOpen = false;
 uint8_t settingsSel  = 0;
 // "vibrate" sits next to "sound" on purpose — both are user-facing
 // feedback toggles; pairing them keeps the audio/haptic story together.
-// Adding here shifts every later index by 1 — applySetting and the
-// drawSettings special-case ladder were updated in lockstep.
-const char* settingsItems[] = { "brightness", "sound", "vibrate", "bluetooth", "wifi", "led", "transcript", "clock rot", "input mode", "ascii pet", "reset", "back" };
-const uint8_t SETTINGS_N = 12;
+// "quotes" sits next to "transcript" because both control passive
+// on-screen content. Each insert shifted later indices — applySetting
+// and the drawSettings special-case ladder were updated in lockstep.
+const char* settingsItems[] = { "brightness", "sound", "vibrate", "bluetooth", "wifi", "led", "transcript", "quotes", "clock rot", "input mode", "ascii pet", "reset", "back" };
+const uint8_t SETTINGS_N = 13;
 
 bool    resetOpen = false;
 uint8_t resetSel  = 0;
@@ -180,8 +204,9 @@ static void applySetting(uint8_t idx) {
     case 4: s.wifi = !s.wifi; break;   // stored only — no WiFi stack linked
     case 5: s.led = !s.led; break;
     case 6: s.hud = !s.hud; break;
-    case 7: s.clockRot = (s.clockRot + 1) % 3; break;
-    case 8:
+    case 7: s.quotes = !s.quotes; break;
+    case 8: s.clockRot = (s.clockRot + 1) % 3; break;
+    case 9:
       // Mode toggle: BLE init / USB input gate is decided once at boot
       // (see setup() and dataPoll()), so the user has to reboot for the
       // change to actually flip transports. We save here, then schedule
@@ -192,9 +217,9 @@ static void applySetting(uint8_t idx) {
       delay(500);
       ESP.restart();
       return;   // unreachable
-    case 9: nextPet(); return;
-    case 10: resetOpen = true; resetSel = 0; resetConfirmIdx = 0xFF; return;
-    case 11: settingsOpen = false; characterInvalidate(); return;
+    case 10: nextPet(); return;
+    case 11: resetOpen = true; resetSel = 0; resetConfirmIdx = 0xFF; return;
+    case 12: settingsOpen = false; characterInvalidate(); return;
   }
   settingsSave();
 }
@@ -280,7 +305,7 @@ static void drawSettings() {
   spr.drawRoundRect(mx, my, mw, mh, 4, p.textDim);
   spr.setTextSize(1);
   Settings& s = settings();
-  bool vals[] = { s.sound, s.vibrate, s.bt, s.wifi, s.led, s.hud };
+  bool vals[] = { s.sound, s.vibrate, s.bt, s.wifi, s.led, s.hud, s.quotes };
   for (int i = 0; i < SETTINGS_N; i++) {
     bool sel = (i == settingsSel);
     spr.setTextColor(sel ? p.text : p.textDim, PANEL);
@@ -291,15 +316,15 @@ static void drawSettings() {
     spr.setTextColor(p.textDim, PANEL);
     if (i == 0) {
       spr.printf("%u/4", brightLevel);
-    } else if (i >= 1 && i <= 6) {
+    } else if (i >= 1 && i <= 7) {
       spr.setTextColor(vals[i-1] ? GREEN : p.textDim, PANEL);
       spr.print(vals[i-1] ? " on" : "off");
-    } else if (i == 7) {
+    } else if (i == 8) {
       static const char* const RN[] = { "auto", "port", "land" };
       spr.print(RN[s.clockRot]);
-    } else if (i == 8) {
-      spr.print(s.inputMode == 1 ? " cli" : "desk");
     } else if (i == 9) {
+      spr.print(s.inputMode == 1 ? " cli" : "desk");
+    } else if (i == 10) {
       uint8_t total = buddySpeciesCount() + (gifAvailable ? 1 : 0);
       uint8_t pos   = buddyMode ? buddySpeciesIdx() + 1 : total;
       spr.printf("%u/%u", pos, total);
@@ -528,8 +553,139 @@ bool checkShake() {
   return delta > 0.8f;
 }
 
+// ---- speech-bubble quotes -------------------------------------------------
+// activeQuote is non-null while a bubble is on screen; quotePoll() is
+// what arms / clears it. Reads from two sources, in priority order:
+//   1) bridge-pushed quote (data.h sets bridgeQuoteBuf when a JSON
+//      payload includes a "quote" field — that's the LLM path)
+//   2) hardcoded QUOTES[] pool, fired on a 5–12 min idle timer
+// The render path only sees `activeQuote`, so it doesn't care which.
 
+bool quoteVisible() {
+  return activeQuote != nullptr
+      && (millis() - quoteShownAt) < QUOTE_TTL_MS;
+}
 
+// Schedule the next local pick at a random offset within the
+// [QUOTE_MIN_GAP_MS, QUOTE_MAX_GAP_MS] window. Called whenever the
+// previous bubble closes or quotes are toggled back on.
+static void scheduleNextQuote() {
+  uint32_t span = QUOTE_MAX_GAP_MS - QUOTE_MIN_GAP_MS;
+  nextLocalQuoteAt = millis() + QUOTE_MIN_GAP_MS + random(span);
+}
+
+// First-quote schedule (post-boot or after toggle re-enable). Tighter
+// window so the buddy actually says something during the first minute
+// of use instead of looking dead.
+static void scheduleFirstQuote() {
+  uint32_t span = QUOTE_FIRST_MAX_MS - QUOTE_FIRST_MIN_MS;
+  nextLocalQuoteAt = millis() + QUOTE_FIRST_MIN_MS + random(span);
+}
+
+// Drive the quote state machine. Called from loop() once per frame.
+// `homeIdle` means: plain home screen, screen on, no overlay, no
+// prompt — i.e. it's actually OK to make the buddy speak right now.
+static void quotePoll(bool homeIdle) {
+  uint32_t now = millis();
+
+  // Auto-clear an expired bubble. We don't free bridgeQuoteBuf — the
+  // pointer is just dropped; next bridge push will overwrite the buffer.
+  if (activeQuote && now - quoteShownAt >= QUOTE_TTL_MS) {
+    activeQuote = nullptr;
+  }
+
+  if (!settings().quotes) {
+    // Toggle off mid-bubble: yank it. Also reset the schedule so flipping
+    // back on doesn't unleash a queued one immediately.
+    activeQuote = nullptr;
+    nextLocalQuoteAt = 0;
+    return;
+  }
+  if (nextLocalQuoteAt == 0) scheduleFirstQuote();
+
+  // 1) Bridge wins: if a fresh push arrived since we last consumed,
+  //    show it regardless of the local schedule. We still respect the
+  //    "is the screen ready" gate to avoid talking over a prompt.
+  extern TamaState tama;
+  if (homeIdle && tama.quoteAtMs && tama.quoteAtMs != bridgeQuoteSeenAt) {
+    bridgeQuoteSeenAt = tama.quoteAtMs;
+    strncpy(bridgeQuoteBuf, tama.quote, sizeof(bridgeQuoteBuf) - 1);
+    bridgeQuoteBuf[sizeof(bridgeQuoteBuf) - 1] = 0;
+    activeQuote = bridgeQuoteBuf;
+    quoteShownAt = now;
+    scheduleNextQuote();
+    return;
+  }
+
+  // 2) Local pool, on the idle timer.
+  if (homeIdle && !activeQuote && now >= nextLocalQuoteAt && QUOTE_COUNT > 0) {
+    int16_t idx;
+    // Avoid back-to-back duplicates. With 40+ quotes in the pool one
+    // re-roll is plenty; we don't loop forever.
+    do { idx = random(QUOTE_COUNT); } while (idx == lastQuoteIdx && QUOTE_COUNT > 1);
+    lastQuoteIdx = idx;
+    activeQuote = QUOTES[idx];
+    quoteShownAt = now;
+    scheduleNextQuote();
+  }
+}
+
+// Speech bubble: rounded rect on the right half of the canvas with a
+// small triangular tail pointing left (toward the pet, which has been
+// shifted to x=80 by the loop's transition handler). Renders at font
+// size 2 — readable at arm's length, which is the actual use case. The
+// pet's peek-cropped sprite ends around x=115, so the bubble starts at
+// x=120 with a 5 px right margin. quotes.h enforces a max single-word
+// length compatible with the resulting char/line budget.
+static void drawQuoteBubble() {
+  if (!activeQuote) return;
+  const Palette& p = characterPalette();
+  const int X = 120, Y = 14, BW = 195, BH = 100;
+  const int PAD_X = 8, PAD_Y = 10;
+
+  spr.fillRoundRect(X, Y, BW, BH, 6, PANEL);
+  spr.drawRoundRect(X, Y, BW, BH, 6, p.textDim);
+  // tail: small filled triangle hanging off the left edge, mid-height
+  spr.fillTriangle(X, Y + BH/2 - 6, X, Y + BH/2 + 6, X - 8, Y + BH/2, PANEL);
+  spr.drawLine(X, Y + BH/2 - 6, X - 8, Y + BH/2, p.textDim);
+  spr.drawLine(X, Y + BH/2 + 6, X - 8, Y + BH/2, p.textDim);
+
+  spr.setTextSize(2);
+  spr.setTextColor(p.text, PANEL);
+  // Naïve word wrap. At size 2: 12 px/glyph, 16 px/row + 3 px line gap.
+  // Usable width = BW - 2*PAD_X = 179 → ~14 chars/line.
+  const int chrW   = 12;
+  const int chrH   = 16;
+  const int rowH   = chrH + 3;
+  const int maxCh  = (BW - 2 * PAD_X) / chrW;
+  const int maxRows = (BH - 2 * PAD_Y) / rowH;
+
+  const char* s = activeQuote;
+  int row = 0;
+  while (*s && row < maxRows) {
+    while (*s == ' ') s++;
+    // measure the next chunk that fits
+    int take = 0, lastSpace = -1;
+    while (s[take] && take < maxCh) {
+      if (s[take] == ' ') lastSpace = take;
+      take++;
+    }
+    int useTake = take;
+    if (s[take] && lastSpace > 0 && row < maxRows - 1) useTake = lastSpace;
+
+    char line[40];
+    int n = useTake < (int)sizeof(line) - 1 ? useTake : (int)sizeof(line) - 1;
+    memcpy(line, s, n);
+    line[n] = 0;
+    spr.setCursor(X + PAD_X, Y + PAD_Y + row * rowH);
+    spr.print(line);
+    s += useTake;
+    row++;
+  }
+  // Restore baseline so the next overlay (drawTopBar / drawSettings /
+  // drawHUD etc.) doesn't inherit size 2.
+  spr.setTextSize(1);
+}
 
 // Persistent screen-level title row ("INFO  n/3") matching the PET header,
 // then a per-page section label below it. The fixed title is the cue that
@@ -942,6 +1098,27 @@ static void drawTopBar() {
   spr.print(buf);
 }
 
+// HH:MM clock pinned just above the avatar on the home screen. Sits in
+// the gap between the top-row battery readout (y=3..11) and the pet
+// body (y=46+ at scale 2). No rtcValid gate — the user explicitly
+// asked for an always-visible clock, so we trust whatever the BM8563
+// returns; a cold device will show 00:00 until the bridge syncs (or
+// the RTC retains time across boots from a previous sync, which is
+// the common case). Hidden only behind a quote bubble (overlap with
+// the bubble's top edge); the dim text colour while RTC is unsynced
+// is the visual "this is a default value, not real time" signal.
+static void drawAvatarClock() {
+  const Palette& p = characterPalette();
+  spr.setTextSize(2);
+  char hm[6];
+  snprintf(hm, sizeof(hm), "%02u:%02u", _clkTm.hours, _clkTm.minutes);
+  int w = strlen(hm) * 12;  // 12 px/glyph at size 2
+  spr.setTextColor(dataRtcValid() ? p.text : p.textDim, p.bg);
+  spr.setCursor((W - w) / 2, 18);
+  spr.print(hm);
+  spr.setTextSize(1);   // restore baseline for downstream draw fns
+}
+
 // HUD content goes stale after 60 s of no new transcript line and no msg
 // change. Without this the last command/status sat on screen forever,
 // long after it was useful — and with the bridge sending heartbeats
@@ -1263,35 +1440,46 @@ void loop() {
 
   // blink bookkeeping
 
-  // Charging clock: takes over the home screen when on USB power, no
-  // overlays, no prompt, no live Claude data, and the RTC has been set
-  // by the bridge. Pet sleeps underneath. Exit restores Y via
-  // applyDisplayMode() so the next mode-switch isn't visually offset.
+  // Drive the speech-bubble timer. homeIdle is the same gate the clock
+  // uses, plus !screenOff — it's the "nothing else is happening" check.
+  // Done here (after the prompt/menu state is settled, before clocking
+  // is computed) so quoteVisible() can be queried alongside `clocking`
+  // when deciding which side of the canvas the pet sits on.
+  bool homeIdle = displayMode == DISP_NORMAL
+               && !menuOpen && !settingsOpen && !resetOpen && !inPrompt
+               && !screenOff && !napping && !blePasskey();
+  quotePoll(homeIdle);
+  bool quoteUp = quoteVisible();
+
+  // RTC refresh keeps _clkTm fresh for drawAvatarClock (and for the
+  // time-of-day animation state machine below). The full-screen clock
+  // takeover that this used to drive was retired in favour of the
+  // always-visible small clock above the pet — drawClock is no longer
+  // called from the rendering block.
   clockRefreshRtc();   // 1Hz internal throttle; also caches _onUsb
-  // Show the clock when nothing is happening — bridge heartbeat alone
-  // doesn't count as activity (it's the only way to get the RTC synced).
+  // `clocking` is now purely a "buddy is in ambient mode" signal — USB
+  // attached, no Claude work in flight, RTC synced. It still gates the
+  // time-of-day pet animations (sleep at night, dizzy late, Friday
+  // celebrate) further down. The visual takeover and pet x-flip that
+  // it used to trigger are gone.
   bool clocking = displayMode == DISP_NORMAL
                && !menuOpen && !settingsOpen && !resetOpen && !inPrompt
                && tama.sessionsRunning == 0 && tama.sessionsWaiting == 0
-               && dataRtcValid() && _onUsb;
-  if (clocking) clockUpdateOrient();
-  else { clockOrient = 0; orientFrames = 0; paintedOrient = 0; }
-  bool landscapeClock = clocking && clockOrient != 0;
+               && dataRtcValid() && _onUsb && !quoteUp;
+  clockOrient = 0; orientFrames = 0; paintedOrient = 0;
 
-  static bool wasClocking = false;
-  static bool wasLandscape = false;
-  if (clocking != wasClocking || landscapeClock != wasLandscape) {
-    if (clocking && !landscapeClock) characterSetPeek(true);
+  // Pet sits on the left half only while a quote bubble is up. Clocking
+  // no longer pushes it — the small avatar-top clock doesn't fight the
+  // pet for canvas space.
+  bool wantsPetLeft = quoteUp;
+  static bool wasPetLeft = false;
+  if (wantsPetLeft != wasPetLeft) {
+    if (wantsPetLeft) characterSetPeek(true);
     else applyDisplayMode();
-    // Pet sits centred (160) on the home screen; clock face needs the
-    // right half free, so push pet to the left half (80) whenever the
-    // clock is up — portrait *and* landscape (the landscape draw also
-    // hardcodes a left-side clear at x=0..115).
-    buddySetXCenter(clocking ? 80 : 160);
+    buddySetXCenter(wantsPetLeft ? 80 : 160);
     characterInvalidate();
     if (buddyMode) buddyInvalidate();
-    wasClocking = clocking;
-    wasLandscape = landscapeClock;
+    wasPetLeft = wantsPetLeft;
   }
 
   // Pet poke: tap the avatar (or its general neighbourhood) to trigger
@@ -1370,9 +1558,8 @@ void loop() {
   if (pk && !lastPasskey) { wake(); beep(1800, 60); }
   lastPasskey = pk;
 
-  if (napping || screenOff || landscapeClock) {
-    // skip sprite render — face-down, powered off, or landscape clock
-    // (which draws direct-to-LCD below)
+  if (napping || screenOff) {
+    // skip sprite render — face-down or powered off.
   } else if (buddyMode) {
     buddyTick(activeState);
   } else if (characterLoaded()) {
@@ -1400,24 +1587,31 @@ void loop() {
       spr.print("no character loaded");
     }
   }
-  if (landscapeClock) {
-    drawClock();
-  } else if (!napping && !screenOff) {
+  if (!napping && !screenOff) {
     if (blePasskey()) drawPasskey();
-    else if (clocking) drawClock();
     else if (displayMode == DISP_INFO) drawInfo();
     else if (displayMode == DISP_PET) drawPet();
     else if (settings().hud) drawHUD();
-    // Top status bar: only on the plain home screen. Approval, menus,
-    // info/pet pages, the clock face and the passkey screen have their
-    // own headers — painting the bar over them just clobbers their
-    // titles. Drawn last so transient pet repaints (which clear y=0..)
-    // don't wipe it.
+    // Top status bar + always-on small clock: only on the plain home
+    // screen. Approval, menus, info/pet pages, the passkey screen all
+    // have their own headers — painting over them just clobbers their
+    // titles. The full-screen clock takeover used to be a fourth
+    // exclusion here but it was retired in favour of drawAvatarClock,
+    // so home is anything that isn't an explicit overlay.
     bool homeScreen = displayMode == DISP_NORMAL
                    && !tama.promptId[0]
                    && !menuOpen && !settingsOpen && !resetOpen
-                   && !blePasskey() && !clocking;
+                   && !blePasskey();
     if (homeScreen) drawTopBar();
+    // Avatar clock: top-of-pet HH:MM on the plain home screen. Suppressed
+    // when the bubble or full-screen clock owns the canvas — both would
+    // either overlap or duplicate the same info.
+    if (homeScreen && !quoteUp) drawAvatarClock();
+    // Speech bubble draws on top of the HUD/transcript content but below
+    // any modal overlay (menu/settings/reset). quotePoll() already gates
+    // visibility to homeIdle, so we can paint unconditionally here — if
+    // it's not supposed to be up, drawQuoteBubble is a no-op.
+    drawQuoteBubble();
     if (resetOpen) drawReset();
     else if (settingsOpen) drawSettings();
     else if (menuOpen) drawMenu();
