@@ -606,7 +606,6 @@ static void quotePoll(bool homeIdle) {
   // 1) Bridge wins: if a fresh push arrived since we last consumed,
   //    show it regardless of the local schedule. We still respect the
   //    "is the screen ready" gate to avoid talking over a prompt.
-  extern TamaState tama;
   if (homeIdle && tama.quoteAtMs && tama.quoteAtMs != bridgeQuoteSeenAt) {
     bridgeQuoteSeenAt = tama.quoteAtMs;
     strncpy(bridgeQuoteBuf, tama.quote, sizeof(bridgeQuoteBuf) - 1);

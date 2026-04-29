@@ -100,6 +100,57 @@ firmware already accepts (`_usbLine.feed(Serial, out)` in `data.h`), so
 we can run the CLI relay alongside an active desktop connection without
 unpairing.
 
+## Optional: LLM speech-bubble quotes
+
+When the firmware's quote feature is on (`Settings → quotes`), the buddy
+shows random one-liners from a hardcoded pool every few minutes. If you
+want the bubble to occasionally comment on what Claude is *actually
+doing*, the relay can call Anthropic's API per `PreToolUse` and push a
+contextual quote on top of the local pool.
+
+Opt in with two env vars in the same shell that runs Claude Code:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+export BUDDY_QUOTE_LLM=1
+```
+
+Install the SDK once:
+
+```bash
+pipx install anthropic
+```
+
+After that, every hook fire has a small probability (default 5 %) of
+spawning a detached subprocess that calls Haiku, generates a quip about
+the upcoming command, and sends `{"quote":"..."}` to the buddy. The
+relay itself is **not** delayed — the quote subprocess runs in parallel
+and the bubble pops up whenever the API responds (typically 1–2 s after
+you tap A or B).
+
+Knobs:
+
+- `BUDDY_QUOTE_PROB` (default `0.05`) — fraction of hook fires that
+  attempt a quote.
+- `BUDDY_QUOTE_COOLDOWN_S` (default `300`) — minimum seconds between
+  successful sends, enforced via a touch file in `$TMPDIR`.
+- `BUDDY_QUOTE_MODEL` (default `claude-haiku-4-5-20251001`) — override
+  the model.
+- `BUDDY_PET_NAME` (default `buddy`) — name baked into the system
+  prompt so the LLM speaks in-character.
+
+Manual test (sends one quote synchronously, no probability gate):
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-... BUDDY_QUOTE_LLM=1 \
+  tools/buddy_relay --llm-quote --tool Bash --hint "rm -rf /tmp/cache"
+```
+
+Cost is trivial (Haiku, ~150 tokens/call). If the SDK or API key is
+missing, or the model errors out, the quote subprocess silently exits
+and the local pool keeps doing its thing — the feature is fail-soft by
+design.
+
 ## Limitations / next steps
 
 - **One-shot per call**: if Claude Code triggers many tool calls in
