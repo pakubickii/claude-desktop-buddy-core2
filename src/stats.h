@@ -178,6 +178,7 @@ inline uint8_t statsFedProgress() {
 
 struct Settings {
   bool sound;
+  bool vibrate;  // haptic feedback — currently only the avatar-poke handler reads this
   bool bt;
   bool wifi;     // placeholder — no WiFi stack linked yet, just stores the pref
   bool led;
@@ -186,12 +187,13 @@ struct Settings {
   uint8_t inputMode; // 0=desktop (BLE owns prompts), 1=cli (USB-serial owns prompts)
 };
 
-static Settings _settings = { true, true, false, true, true, 0, 0 };
+static Settings _settings = { true, true, true, false, true, true, 0, 0 };
 
 inline void settingsLoad() {
   _prefs.begin("buddy", true);
-  _settings.sound = _prefs.getBool("s_snd", true);
-  _settings.bt    = _prefs.getBool("s_bt",  true);
+  _settings.sound   = _prefs.getBool("s_snd", true);
+  _settings.vibrate = _prefs.getBool("s_vib", true);
+  _settings.bt      = _prefs.getBool("s_bt",  true);
   _settings.wifi  = _prefs.getBool("s_wifi",false);
   _settings.led   = _prefs.getBool("s_led", true);
   _settings.hud      = _prefs.getBool("s_hud", true);
@@ -205,6 +207,7 @@ inline void settingsLoad() {
 inline void settingsSave() {
   _prefs.begin("buddy", false);
   _prefs.putBool("s_snd", _settings.sound);
+  _prefs.putBool("s_vib", _settings.vibrate);
   _prefs.putBool("s_bt",  _settings.bt);
   _prefs.putBool("s_wifi",_settings.wifi);
   _prefs.putBool("s_led", _settings.led);

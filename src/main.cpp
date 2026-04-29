@@ -35,6 +35,12 @@ TamaState    tama;
 PersonaState baseState   = P_SLEEP;
 PersonaState activeState = P_SLEEP;
 uint32_t     oneShotUntil = 0;
+// Non-blocking vibration: setVibration is fire-and-forget — once on, the
+// motor stays on until you explicitly call setVibration(0). The poke
+// handler arms this; the loop turns the motor off when the deadline
+// passes. 0 means "no pulse pending" — distinguished by "and we're not
+// past the deadline" so wraparound after ~49 days doesn't matter.
+uint32_t     vibrateUntil = 0;
 uint32_t     lastShakeCheck = 0;
 float        accelBaseline = 1.0f;
 unsigned long t = 0;
@@ -141,8 +147,12 @@ const uint8_t MENU_N = 6;
 
 bool    settingsOpen = false;
 uint8_t settingsSel  = 0;
-const char* settingsItems[] = { "brightness", "sound", "bluetooth", "wifi", "led", "transcript", "clock rot", "input mode", "ascii pet", "reset", "back" };
-const uint8_t SETTINGS_N = 11;
+// "vibrate" sits next to "sound" on purpose — both are user-facing
+// feedback toggles; pairing them keeps the audio/haptic story together.
+// Adding here shifts every later index by 1 — applySetting and the
+// drawSettings special-case ladder were updated in lockstep.
+const char* settingsItems[] = { "brightness", "sound", "vibrate", "bluetooth", "wifi", "led", "transcript", "clock rot", "input mode", "ascii pet", "reset", "back" };
+const uint8_t SETTINGS_N = 12;
 
 bool    resetOpen = false;
 uint8_t resetSel  = 0;
@@ -159,18 +169,19 @@ static void applySetting(uint8_t idx) {
       applyBrightness();
       return;
     case 1: s.sound = !s.sound; break;
-    case 2:
+    case 2: s.vibrate = !s.vibrate; break;
+    case 3:
       // BT toggle is a stored preference only — BLE stays live. Turning
       // BLE off cleanly would require tearing down the BLE stack which
       // the Arduino BLE library doesn't do reliably. If we need a
       // hard-off someday, stop advertising via BLEDevice::getAdvertising().
       s.bt = !s.bt;
       break;
-    case 3: s.wifi = !s.wifi; break;   // stored only — no WiFi stack linked
-    case 4: s.led = !s.led; break;
-    case 5: s.hud = !s.hud; break;
-    case 6: s.clockRot = (s.clockRot + 1) % 3; break;
-    case 7:
+    case 4: s.wifi = !s.wifi; break;   // stored only — no WiFi stack linked
+    case 5: s.led = !s.led; break;
+    case 6: s.hud = !s.hud; break;
+    case 7: s.clockRot = (s.clockRot + 1) % 3; break;
+    case 8:
       // Mode toggle: BLE init / USB input gate is decided once at boot
       // (see setup() and dataPoll()), so the user has to reboot for the
       // change to actually flip transports. We save here, then schedule
@@ -181,9 +192,9 @@ static void applySetting(uint8_t idx) {
       delay(500);
       ESP.restart();
       return;   // unreachable
-    case 8: nextPet(); return;
-    case 9: resetOpen = true; resetSel = 0; resetConfirmIdx = 0xFF; return;
-    case 10: settingsOpen = false; characterInvalidate(); return;
+    case 9: nextPet(); return;
+    case 10: resetOpen = true; resetSel = 0; resetConfirmIdx = 0xFF; return;
+    case 11: settingsOpen = false; characterInvalidate(); return;
   }
   settingsSave();
 }
@@ -269,7 +280,7 @@ static void drawSettings() {
   spr.drawRoundRect(mx, my, mw, mh, 4, p.textDim);
   spr.setTextSize(1);
   Settings& s = settings();
-  bool vals[] = { s.sound, s.bt, s.wifi, s.led, s.hud };
+  bool vals[] = { s.sound, s.vibrate, s.bt, s.wifi, s.led, s.hud };
   for (int i = 0; i < SETTINGS_N; i++) {
     bool sel = (i == settingsSel);
     spr.setTextColor(sel ? p.text : p.textDim, PANEL);
@@ -280,15 +291,15 @@ static void drawSettings() {
     spr.setTextColor(p.textDim, PANEL);
     if (i == 0) {
       spr.printf("%u/4", brightLevel);
-    } else if (i >= 1 && i <= 5) {
+    } else if (i >= 1 && i <= 6) {
       spr.setTextColor(vals[i-1] ? GREEN : p.textDim, PANEL);
       spr.print(vals[i-1] ? " on" : "off");
-    } else if (i == 6) {
+    } else if (i == 7) {
       static const char* const RN[] = { "auto", "port", "land" };
       spr.print(RN[s.clockRot]);
-    } else if (i == 7) {
-      spr.print(s.inputMode == 1 ? " cli" : "desk");
     } else if (i == 8) {
+      spr.print(s.inputMode == 1 ? " cli" : "desk");
+    } else if (i == 9) {
       uint8_t total = buddySpeciesCount() + (gifAvailable ? 1 : 0);
       uint8_t pos   = buddyMode ? buddySpeciesIdx() + 1 : total;
       spr.printf("%u/%u", pos, total);
@@ -1070,6 +1081,15 @@ void loop() {
   t++;
   uint32_t now = millis();
 
+  // Vibration auto-off. Tied to the poke handler below — that arms
+  // vibrateUntil; we cut the motor here when the pulse window closes.
+  // Done at the top of the frame so the timing is independent of how
+  // long the rest of the frame takes.
+  if (vibrateUntil && (int32_t)(now - vibrateUntil) >= 0) {
+    M5.Power.setVibration(0);
+    vibrateUntil = 0;
+  }
+
   dataPoll(&tama);
   if (statsPollLevelUp()) triggerOneShot(P_CELEBRATE, 3000);
   baseState = derive(tama);
@@ -1304,9 +1324,24 @@ void loop() {
         uint16_t freq = (pick == P_HEART)     ? 1600     // sweet
                       : (pick == P_CELEBRATE) ? 2400     // bright
                                               : 400;     // woozy
+        // Vibration: per-reaction haptic mirroring the audio cue.
+        // Always intensity 255 — the Core2 motor (AXP192-driven) has a
+        // start-voltage threshold somewhere ≥150/255 on this unit, so
+        // sub-threshold values just fail to spin the motor at all.
+        // Differentiation is by *duration* instead: short = sweet,
+        // medium = excited, long = wobbly. No setting toggle on purpose
+        // — pokes are user-initiated, so the buzz is opt-in by
+        // definition; add one later if it turns out to be annoying.
+        uint32_t vibMs = (pick == P_HEART)     ? 90      // brief
+                      : (pick == P_CELEBRATE) ? 160     // upbeat
+                                              : 280;    // dizzy lingers
         wake();
         triggerOneShot(pick, dur);
         beep(freq, 80);
+        if (settings().vibrate) {
+          M5.Power.setVibration(255);
+          vibrateUntil = millis() + vibMs;
+        }
       }
     }
   }
