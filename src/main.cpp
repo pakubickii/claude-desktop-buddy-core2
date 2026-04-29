@@ -1273,7 +1273,49 @@ void loop() {
     wasClocking = clocking;
     wasLandscape = landscapeClock;
   }
-  if (clocking) {
+
+  // Pet poke: tap the avatar (or its general neighbourhood) to trigger
+  // a random reaction — heart most of the time, occasionally celebrate
+  // or dizzy. Only on the plain home screen; menus, prompts and the
+  // BLE passkey overlay all swallow the tap. screenOff is intentionally
+  // excluded so a wake-tap doesn't double as a poke. Re-tapping during
+  // the oneShot just restarts the timer, which lets the user "pet" by
+  // holding or repeatedly tapping.
+  if (!screenOff && displayMode == DISP_NORMAL
+      && !inPrompt && !menuOpen && !settingsOpen && !resetOpen
+      && !blePasskey()) {
+    auto t = M5.Touch.getDetail();
+    if (t.wasPressed()) {
+      // Generous hit-box centred on the avatar. Pet sits at
+      // BUDDY_X_CENTER (160 home, 80 clock) and renders ~120 px wide
+      // at scale 2. x∈[40,280] so beginners don't have to hunt the
+      // exact glyph; y∈[0,170] keeps the bottom HUD strip and the
+      // [A][B][C] hint row out of the hit area so taps there don't
+      // false-fire.
+      if (t.x >= 40 && t.x <= 280 && t.y >= 0 && t.y <= 170) {
+        // 2× HEART weights ~50/25/25. Heart is the "expected" loving
+        // reaction; celebrate adds excitement; dizzy is the "you poked
+        // me too hard" gag — small enough chance to feel like a treat.
+        static const PersonaState pokes[] = {
+          P_HEART, P_HEART, P_CELEBRATE, P_DIZZY
+        };
+        PersonaState pick = pokes[random(sizeof(pokes)/sizeof(pokes[0]))];
+        uint32_t dur  = (pick == P_DIZZY) ? 2000 : 2500;
+        uint16_t freq = (pick == P_HEART)     ? 1600     // sweet
+                      : (pick == P_CELEBRATE) ? 2400     // bright
+                                              : 400;     // woozy
+        wake();
+        triggerOneShot(pick, dur);
+        beep(freq, 80);
+      }
+    }
+  }
+
+  // Time-of-day state machine for the clock-takeover screen. Gated on
+  // oneShotUntil so a poke landing mid-clocking actually shows its
+  // animation instead of getting clobbered on the next frame by the
+  // P_SLEEP / P_IDLE override below.
+  if (clocking && (int32_t)(now - oneShotUntil) >= 0) {
     uint8_t dow = clockDow();
     bool weekend = (dow == 0 || dow == 6);
     bool friday  = (dow == 5);
