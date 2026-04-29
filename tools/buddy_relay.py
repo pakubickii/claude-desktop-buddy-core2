@@ -37,12 +37,22 @@ import asyncio
 import glob
 import json
 import os
+import random
+import subprocess
 import sys
+import tempfile
 import time
 import uuid
+from pathlib import Path
 
 DEFAULT_TIMEOUT_S = 60
 DEFAULT_BAUD = 115200
+
+# LLM-quote knobs. All optional — feature is OFF unless BUDDY_QUOTE_LLM=1.
+DEFAULT_QUOTE_PROB        = 0.05      # ~5% of hook fires generate a quote
+DEFAULT_QUOTE_COOLDOWN_S  = 5 * 60    # min seconds between LLM quote sends
+DEFAULT_QUOTE_MODEL       = "claude-haiku-4-5-20251001"
+QUOTE_MAX_CHARS           = 56        # firmware bubble fits ~14 chars × 4 lines
 
 NUS_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 NUS_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
@@ -265,6 +275,211 @@ def _relay_usb(tool: str, hint: str, timeout: float):
         except Exception: pass
 
 
+# ───────────────────────────── LLM-quote transport ──────────────────────
+#
+# Fire-and-forget single-line senders for the speech-bubble quote. Distinct
+# from _relay_ble / _relay_usb because the quote send doesn't wait for a
+# response — it just writes one JSON frame and disconnects. Used by the
+# detached subprocess spawned in `_maybe_spawn_quote`.
+
+async def _send_quote_ble(text: str) -> bool:
+    try:
+        from bleak import BleakScanner, BleakClient
+        from bleak.exc import BleakError
+    except ImportError:
+        return False
+    name_prefix = os.environ.get("BUDDY_NAME_PREFIX", "Claude-")
+    pinned_name = os.environ.get("BUDDY_BLE_NAME")
+    pinned_addr = os.environ.get("BUDDY_BLE_ADDR")
+    scan_s = float(os.environ.get("BUDDY_BLE_SCAN_S", "3"))
+    try:
+        devices = await BleakScanner.discover(timeout=scan_s)
+    except BleakError:
+        return False
+    target = None
+    for d in devices:
+        if pinned_addr and d.address.lower() == pinned_addr.lower():
+            target = d; break
+        if pinned_name and d.name == pinned_name:
+            target = d; break
+        if not pinned_addr and not pinned_name and d.name and d.name.startswith(name_prefix):
+            target = d; break
+    if not target:
+        return False
+    try:
+        async with BleakClient(target, timeout=10.0) as client:
+            msg = json.dumps({"quote": text[:QUOTE_MAX_CHARS]}) + "\n"
+            await client.write_gatt_char(NUS_RX_UUID, msg.encode(), response=True)
+            return True
+    except BleakError:
+        return False
+
+
+def _send_quote_usb(text: str) -> bool:
+    try:
+        import serial
+    except ImportError:
+        return False
+    port = _find_usb_port()
+    if not port:
+        return False
+    s = serial.Serial()
+    s.port = port
+    s.baudrate = DEFAULT_BAUD
+    s.timeout = 0.2
+    s.dtr = False
+    s.rts = False
+    try:
+        s.open()
+    except serial.SerialException:
+        return False
+    try:
+        # USB open toggles DTR; the firmware reset wipes any in-flight buffer.
+        # Wait for boot before writing — same as the relay path.
+        time.sleep(2.5)
+        msg = json.dumps({"quote": text[:QUOTE_MAX_CHARS]}) + "\n"
+        s.write(msg.encode())
+        s.flush()
+        # Brief drain so the firmware's line buffer actually sees the write
+        # before we close the port (which yanks DTR and resets it again).
+        time.sleep(0.4)
+        return True
+    finally:
+        try: s.close()
+        except Exception: pass
+
+
+def _send_quote(text: str) -> bool:
+    """Try BLE, fall back to USB. Mirrors the relay's transport order."""
+    transport = _resolve_transport(None)
+    if transport in ("auto", "ble"):
+        if asyncio.run(_send_quote_ble(text)):
+            return True
+        if transport == "ble":
+            return False
+    return _send_quote_usb(text)
+
+
+# ───────────────────────────── LLM quote ─────────────────────────────────
+
+# Few-shot voice anchors. Same vibe as src/quotes.h — keeping them in sync
+# manually because pulling from C++ at hook time would be silly. If the
+# firmware pool grows substantially, refresh these too.
+_QUOTE_VOICE_EXAMPLES = [
+    "it works on my machine",
+    "regex did nothing wrong",
+    "merge conflicts build character",
+    "it's not a bug, it's emergent behavior",
+    "DNS. it was always DNS.",
+    "you can't grep your way out of bad arch",
+    "i'm not lazy, i'm async",
+    "stack overflow is my therapist",
+]
+
+
+def _quote_cooldown_path() -> Path:
+    return Path(tempfile.gettempdir()) / "buddy_quote_lastfire"
+
+
+def _quote_should_fire() -> bool:
+    """Probability + cooldown gate. Fast/synchronous so the relay isn't
+    delayed by it — the actual API call happens in a subprocess."""
+    if os.environ.get("BUDDY_QUOTE_LLM") != "1":
+        return False
+    prob = float(os.environ.get("BUDDY_QUOTE_PROB", DEFAULT_QUOTE_PROB))
+    if random.random() > prob:
+        return False
+    cooldown = float(os.environ.get("BUDDY_QUOTE_COOLDOWN_S",
+                                    DEFAULT_QUOTE_COOLDOWN_S))
+    p = _quote_cooldown_path()
+    if p.exists():
+        if time.time() - p.stat().st_mtime < cooldown:
+            return False
+    try:
+        p.touch()
+    except OSError:
+        return False
+    return True
+
+
+def _generate_llm_quote(tool: str, hint: str) -> str | None:
+    """Call Anthropic Haiku for a one-line buddy quip about the upcoming
+    tool call. Returns None on any failure — caller treats that as
+    "no quote this round" and silently skips the send."""
+    try:
+        import anthropic
+    except ImportError:
+        print("[buddy] anthropic SDK not installed — pipx install anthropic",
+              file=sys.stderr)
+        return None
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None
+    pet_name = os.environ.get("BUDDY_PET_NAME", "buddy")
+    model = os.environ.get("BUDDY_QUOTE_MODEL", DEFAULT_QUOTE_MODEL)
+
+    examples = "\n".join(f"- {q}" for q in _QUOTE_VOICE_EXAMPLES)
+    system = (
+        f"You are {pet_name}, a desktop hardware buddy that displays a "
+        f"single short quip on a tiny screen when a developer runs a "
+        f"command. Voice: dry, sassy, geeky, technical, lightly "
+        f"self-deprecating. Style anchors:\n{examples}\n\n"
+        f"Output ONE line: ≤{QUOTE_MAX_CHARS} ASCII characters, no emojis, "
+        f"no surrounding quotes, no trailing punctuation unless it's part "
+        f"of the joke. Comment on the developer's action — be specific to "
+        f"what they're doing. Output the quip and nothing else."
+    )
+    user = f"Tool about to run: {tool}\nCommand: {hint[:240]}"
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        resp = client.messages.create(
+            model=model,
+            max_tokens=80,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+    except Exception as e:
+        print(f"[buddy] LLM call failed: {e}", file=sys.stderr)
+        return None
+
+    # Defensive normalisation — strip whitespace, surrounding quotes, and
+    # truncate. Models occasionally wrap their output in quotes despite the
+    # system prompt, so the .strip("'\"") catches that.
+    try:
+        text = resp.content[0].text.strip().strip("'\"").strip()
+    except (IndexError, AttributeError):
+        return None
+    if not text:
+        return None
+    return text[:QUOTE_MAX_CHARS]
+
+
+def _maybe_spawn_quote(tool: str, hint: str) -> None:
+    """Fire-and-forget the LLM-quote pipeline in a detached subprocess.
+    Returns immediately so the parent hook can carry on with the
+    permission relay. The child handles API call, send, and exit on its
+    own — no PID tracked, no waitpid, no shared state past stdin args.
+
+    The probability/cooldown check happens in the parent (cheap, no I/O
+    other than a touch on the cooldown file) so we don't burn a process
+    fork on the 95% of calls that get filtered out anyway.
+    """
+    if not _quote_should_fire():
+        return
+    try:
+        subprocess.Popen(
+            [sys.executable, __file__, "--llm-quote",
+             "--tool", tool, "--hint", hint],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as e:
+        print(f"[buddy] failed to spawn quote subprocess: {e}", file=sys.stderr)
+
+
 # ───────────────────────────── transport picker ──────────────────────────
 
 def _resolve_transport(arg: str | None) -> str:
@@ -350,7 +565,28 @@ def main() -> int:
     ap.add_argument("--transport", choices=("auto", "ble", "usb"), default=None,
                     help="Override transport. Defaults to auto (BLE first, USB fallback). "
                          "Also reads BUDDY_TRANSPORT env.")
+    ap.add_argument("--llm-quote", action="store_true",
+                    help="Internal: generate an LLM speech-bubble quote about "
+                         "--tool/--hint and send it to the buddy, then exit. "
+                         "Used as a detached subprocess by the hook flow; can "
+                         "also be invoked manually for testing.")
     args = ap.parse_args()
+
+    # LLM-quote mode bypasses everything else. Spawned by _maybe_spawn_quote
+    # with the same --tool/--hint that the relay was invoked with, so the
+    # quote can comment on the actual command that's running.
+    if args.llm_quote:
+        if not args.tool or not args.hint:
+            print("[buddy] --llm-quote requires --tool and --hint", file=sys.stderr)
+            return 2
+        text = _generate_llm_quote(args.tool, args.hint)
+        if not text:
+            return 0
+        ok = _send_quote(text)
+        if not ok:
+            print(f"[buddy] generated quote {text!r} but no transport reached "
+                  f"the device", file=sys.stderr)
+        return 0
 
     if args.tool and args.hint:
         return relay(args.tool, args.hint, args.timeout, args.transport)
@@ -373,6 +609,10 @@ def main() -> int:
         force_off = os.environ.get("BUDDY_RELAY_DISABLED") == "1"
         force_on  = os.environ.get("BUDDY_RELAY_FORCE") == "1"
         bypass = force_off or (mode in _BYPASS_MODES and not force_on)
+        # Speech-bubble LLM quote: opportunistic, fires regardless of the
+        # bypass/relay path so autonomous-mode users still get the buddy
+        # commentary. Spawned detached, doesn't block this hook return.
+        _maybe_spawn_quote(tool, hint)
         if bypass:
             why = ("BUDDY_RELAY_DISABLED=1" if force_off
                    else f"permission_mode={mode!r}")

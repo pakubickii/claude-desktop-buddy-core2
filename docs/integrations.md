@@ -58,6 +58,21 @@ that *omits* `prompt` no longer clears `promptId` (that was the
 flickering source for the CLI relay) — explicit `"prompt":null` is the
 only way to clear from the host side.
 
+**Push a speech-bubble quote** (host → device):
+
+```json
+{"quote":"merge conflicts build character"}
+```
+
+The device shows the text in a speech bubble next to the avatar for
+~5.5 s. Each push overrides any local-pool quote currently on screen
+and resets the next-pick timer, so the bridge can keep buddy chatty
+without fighting the firmware's own scheduler. ≤56 ASCII characters
+fit comfortably; longer strings get truncated by the firmware. The
+buddy_relay LLM-quote path uses this to opportunistically inject
+context-aware one-liners on top of the hardcoded pool — see
+`tools/buddy_relay.md`.
+
 ## Pick a transport
 
 ### BLE (Nordic UART Service)
