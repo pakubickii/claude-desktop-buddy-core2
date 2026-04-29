@@ -108,6 +108,7 @@ static void wake() {
   if (dimmed) { applyBrightness(); dimmed = false; }
 }
 bool     responseSent = false;
+uint32_t responseSentMs = 0;
 
 static void beep(uint16_t freq, uint16_t dur) {
   if (settings().sound) M5.Speaker.tone(freq, dur);
@@ -140,8 +141,8 @@ const uint8_t MENU_N = 6;
 
 bool    settingsOpen = false;
 uint8_t settingsSel  = 0;
-const char* settingsItems[] = { "brightness", "sound", "bluetooth", "wifi", "led", "transcript", "clock rot", "ascii pet", "reset", "back" };
-const uint8_t SETTINGS_N = 10;
+const char* settingsItems[] = { "brightness", "sound", "bluetooth", "wifi", "led", "transcript", "clock rot", "input mode", "ascii pet", "reset", "back" };
+const uint8_t SETTINGS_N = 11;
 
 bool    resetOpen = false;
 uint8_t resetSel  = 0;
@@ -169,9 +170,20 @@ static void applySetting(uint8_t idx) {
     case 4: s.led = !s.led; break;
     case 5: s.hud = !s.hud; break;
     case 6: s.clockRot = (s.clockRot + 1) % 3; break;
-    case 7: nextPet(); return;
-    case 8: resetOpen = true; resetSel = 0; resetConfirmIdx = 0xFF; return;
-    case 9: settingsOpen = false; characterInvalidate(); return;
+    case 7:
+      // Mode toggle: BLE init / USB input gate is decided once at boot
+      // (see setup() and dataPoll()), so the user has to reboot for the
+      // change to actually flip transports. We save here, then schedule
+      // a restart half a second later so they see the menu confirm.
+      s.inputMode = (s.inputMode + 1) % 2;
+      settingsSave();
+      Serial.println("[setup] mode toggled — restarting to apply");
+      delay(500);
+      ESP.restart();
+      return;   // unreachable
+    case 8: nextPet(); return;
+    case 9: resetOpen = true; resetSel = 0; resetConfirmIdx = 0xFF; return;
+    case 10: settingsOpen = false; characterInvalidate(); return;
   }
   settingsSave();
 }
@@ -275,6 +287,8 @@ static void drawSettings() {
       static const char* const RN[] = { "auto", "port", "land" };
       spr.print(RN[s.clockRot]);
     } else if (i == 7) {
+      spr.print(s.inputMode == 1 ? " cli" : "desk");
+    } else if (i == 8) {
       uint8_t total = buddySpeciesCount() + (gifAvailable ? 1 : 0);
       uint8_t pos   = buddyMode ? buddySpeciesIdx() + 1 : total;
       spr.printf("%u/%u", pos, total);
@@ -419,9 +433,10 @@ static void drawClock() {
 
   if (clockOrient == 0) {
     paintedOrient = 0;
-    // Core2 landscape: buddy lives in the left half (BUDDY_X_CENTER=80,
-    // see step 8b), clock lives in the right half. Clearing only the
-    // right half so the pet draw isn't fighting the clock's fillRect.
+    // Core2 landscape: clocking transition flipped buddy x-centre to 80
+    // (see loop()'s wasClocking handler) so the pet sits in the left
+    // half and the clock owns the right half. Clear only the right half
+    // — the pet's own tick repaints its strip.
     const int RX = W / 2;                 // 160 — right-half origin
     const int RCX = RX + (W - RX) / 2;    // 240 — right-half center
     spr.fillRect(RX, 0, W - RX, H, p.bg);
@@ -463,9 +478,9 @@ static void drawClock() {
     lastPetTick = millis();
     if (buddyMode) {
       // ASCII glyphs don't self-clear; wipe the box each tick. Species
-      // hardcode BUDDY_X_CENTER=67 / BUDDY_Y_OVERLAY=6 for particles so
-      // keep portrait coords and just swap the surface — pet lands
-      // upper-left of landscape, which is where we want it anyway.
+      // reference BUDDY_X_CENTER (flipped to 80 in clocking) and
+      // BUDDY_Y_OVERLAY for particles, so the pet lands upper-left of
+      // the landscape canvas — which is where we want it anyway.
       M5.Display.fillRect(0, 0, 115, 90, p.bg);
       buddyRenderTo(&M5.Display, activeState);
     } else {
@@ -891,6 +906,42 @@ void drawPet() {
   spr.printf("%u/%u", petPage + 1, PET_PAGES);
 }
 
+// Battery readout pinned to the top-right of the home screen. Charging
+// gets a "+" prefix; <=20% on battery flips to HOT to draw the eye. No
+// strip background or separator — the glyphs sit on whatever the pet
+// renderer left there (always blank at the top corner: pet body starts
+// at y=46 in scale 2). Skipped when a dedicated full-screen mode
+// (info/pet/clock/approval/passkey) or overlay (menu/settings/reset)
+// is up so we don't paint over their own headers.
+static void drawTopBar() {
+  const Palette& p = characterPalette();
+  spr.setTextSize(1);
+  int pct = M5.Power.getBatteryLevel();
+  if (pct < 0) return;
+  bool charging = M5.Power.isCharging();
+  char buf[10];
+  if (charging) snprintf(buf, sizeof(buf), "+%d%%", pct);
+  else          snprintf(buf, sizeof(buf), "%d%%",  pct);
+  uint16_t batColor = (pct <= 20 && !charging) ? HOT
+                     : charging               ? p.body
+                                              : p.text;
+  spr.setTextColor(batColor, p.bg);
+  int w = strlen(buf) * 6;   // 6 px/glyph at size 1
+  spr.setCursor(W - w - 4, 3);
+  spr.print(buf);
+}
+
+// HUD content goes stale after 60 s of no new transcript line and no msg
+// change. Without this the last command/status sat on screen forever,
+// long after it was useful — and with the bridge sending heartbeats
+// every few seconds, just hiding when "nothing arrived" doesn't work,
+// the heartbeat counts as activity. We instead track when the *content*
+// last changed (lineGen bump or tama.msg string change) and hide after
+// HUD_STALE_MS past that timestamp. User scrolling resets it.
+const uint32_t HUD_STALE_MS = 60000;
+static uint32_t hudLastChangeMs = 0;
+static char     hudLastMsg[24]  = "";
+
 void drawHUD() {
   if (tama.promptId[0]) { drawApproval(); return; }
   const Palette& p = characterPalette();
@@ -899,7 +950,21 @@ void drawHUD() {
   spr.fillRect(0, H - AREA, W, AREA, p.bg);
   spr.setTextSize(1);
 
-  if (tama.lineGen != lastLineGen) { msgScroll = 0; lastLineGen = tama.lineGen; wake(); }
+  uint32_t now = millis();
+  if (tama.lineGen != lastLineGen) {
+    msgScroll = 0; lastLineGen = tama.lineGen; wake();
+    hudLastChangeMs = now;
+  }
+  if (strcmp(tama.msg, hudLastMsg) != 0) {
+    strncpy(hudLastMsg, tama.msg, sizeof(hudLastMsg) - 1);
+    hudLastMsg[sizeof(hudLastMsg) - 1] = 0;
+    hudLastChangeMs = now;
+  }
+  if (msgScroll > 0) hudLastChangeMs = now;   // active scroll = active HUD
+
+  bool stale = hudLastChangeMs != 0
+            && (now - hudLastChangeMs) > HUD_STALE_MS;
+  if (stale) return;   // area was cleared above; nothing else to draw
 
   if (tama.nLines == 0) {
     spr.setTextColor(p.text, p.bg);
@@ -940,17 +1005,30 @@ void drawHUD() {
 }
 
 void setup() {
+  Serial.begin(115200);
+  delay(50);
+  Serial.println("[setup] entered");
   auto cfg = M5.config();
   M5.begin(cfg);
+  Serial.println("[setup] M5.begin done");
   M5.Display.setRotation(1);   // Core2 landscape: 320 wide × 240 tall, BtnA/B/C below LCD
-  startBt();
   M5.Power.setLed(0);   // off — no-op on Core2 (no LED), pulses on boards that have one
   applyBrightness();
   lastInteractMs = millis();
   statsLoad();
-  settingsLoad();
+  settingsLoad();   // need inputMode known before we decide whether to start BLE
   petNameLoad();
   buddyInit();
+  // BLE is always on. The Nordic UART Service is the universal entry
+  // point — Hardware Buddy in Desktop, the buddy_relay BLE path, or any
+  // third-party integration all attach here. BLE GATT's single-central
+  // rule gives us a natural runtime mutex for "who owns the prompt
+  // screen right now". The settings.inputMode toggle below only governs
+  // the *additional* USB-input transport, not BLE.
+  startBt();
+  Serial.println(settings().inputMode == 1
+                   ? "[setup] BLE up (cli mode — USB input also accepted)"
+                   : "[setup] BLE up (desktop mode — USB input ignored)");
 
   // BLE stays always-on; s.bt is stored as a preference only.
   spr.createSprite(W, H);
@@ -1020,6 +1098,25 @@ void loop() {
     }
   }
 
+  // After a tap is sent, hold the approval screen for ~1.5 s so the user
+  // sees "sent..." then clear locally. We can't rely on the desktop's
+  // status poll to wipe promptId any more (the new "missing prompt key
+  // is a no-op" rule in data.h means status updates without an explicit
+  // null leave promptId intact), and in cli input mode there might not
+  // even be a desktop attached.
+  // CRITICAL: also reset responseSent here so a *new* prompt arriving
+  // after this clear isn't immediately wiped on the next loop iteration
+  // (we'd see promptId set, responseSent still true, time still > 1.5 s
+  // → clear before drawApproval ever ran). Found while debugging the
+  // BLE relay path.
+  if (responseSent && tama.promptId[0] && millis() - responseSentMs > 1500) {
+    tama.promptId[0] = 0;
+    tama.promptTool[0] = 0;
+    tama.promptHint[0] = 0;
+    responseSent = false;
+    lastPromptId[0] = 0;   // make the next arrival look fresh to the change-detector below
+  }
+
   // BtnA: step through fake scenarios
   // Prompt arrival: beep, reset response flag
   if (strcmp(tama.promptId, lastPromptId) != 0) {
@@ -1085,6 +1182,7 @@ void loop() {
         snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"once\"}", tama.promptId);
         sendCmd(cmd);
         responseSent = true;
+        responseSentMs = millis();
         uint32_t tookS = (millis() - promptArrivedMs) / 1000;
         statsOnApproval(tookS);
         beep(2400, 60);
@@ -1118,6 +1216,7 @@ void loop() {
       snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"deny\"}", tama.promptId);
       sendCmd(cmd);
       responseSent = true;
+      responseSentMs = millis();
       statsOnDenial();
       beep(600, 60);
     } else if (resetOpen) {
@@ -1164,6 +1263,11 @@ void loop() {
   if (clocking != wasClocking || landscapeClock != wasLandscape) {
     if (clocking && !landscapeClock) characterSetPeek(true);
     else applyDisplayMode();
+    // Pet sits centred (160) on the home screen; clock face needs the
+    // right half free, so push pet to the left half (80) whenever the
+    // clock is up — portrait *and* landscape (the landscape draw also
+    // hardcodes a left-side clear at x=0..115).
+    buddySetXCenter(clocking ? 80 : 160);
     characterInvalidate();
     if (buddyMode) buddyInvalidate();
     wasClocking = clocking;
@@ -1227,6 +1331,16 @@ void loop() {
     else if (displayMode == DISP_INFO) drawInfo();
     else if (displayMode == DISP_PET) drawPet();
     else if (settings().hud) drawHUD();
+    // Top status bar: only on the plain home screen. Approval, menus,
+    // info/pet pages, the clock face and the passkey screen have their
+    // own headers — painting the bar over them just clobbers their
+    // titles. Drawn last so transient pet repaints (which clear y=0..)
+    // don't wipe it.
+    bool homeScreen = displayMode == DISP_NORMAL
+                   && !tama.promptId[0]
+                   && !menuOpen && !settingsOpen && !resetOpen
+                   && !blePasskey() && !clocking;
+    if (homeScreen) drawTopBar();
     if (resetOpen) drawReset();
     else if (settingsOpen) drawSettings();
     else if (menuOpen) drawMenu();

@@ -9,9 +9,17 @@ extern M5Canvas spr;
 enum { B_SLEEP, B_IDLE, B_BUSY, B_ATTENTION, B_CELEBRATE, B_DIZZY, B_HEART };
 
 // ──────────────── shared geometry ────────────────
-// Step 8b: pet centred in the LEFT half of the 320×240 landscape canvas
-// (clock + status sit in the right half — see drawClock in main.cpp).
-const int BUDDY_X_CENTER = 80;
+// X_CENTER is mutable: the home screen centres the pet at 160 (so the
+// landscape canvas isn't half empty); the clock face flips it to 80 so
+// the right half can render the time. main.cpp drives the flip via
+// buddySetXCenter() in the clocking transition handler.
+//
+// Y_BASE / Y_OVERLAY stay at their original portrait values. At scale 2
+// (home) the pet body lands at yBase = 30*2 - 14 = 46, leaving the top
+// 14 px clean for the status bar. At scale 1 (info/pet pages) yBase = 30
+// keeps the pet under the y=70 page header. So the bar gets its strip
+// without rewriting any geometry.
+int BUDDY_X_CENTER       = 160;
 const int BUDDY_CANVAS_W = 320;
 const int BUDDY_Y_BASE   = 30;
 const int BUDDY_Y_OVERLAY = 6;
@@ -152,6 +160,12 @@ void buddySetPeek(bool peek) {
   uint8_t s = peek ? 1 : 2;
   if (s == _scale) return;
   _scale = s;
+  buddyInvalidate();
+}
+
+void buddySetXCenter(int x) {
+  if (BUDDY_X_CENTER == x) return;
+  BUDDY_X_CENTER = x;
   buddyInvalidate();
 }
 

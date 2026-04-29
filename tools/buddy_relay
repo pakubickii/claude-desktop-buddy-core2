@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# buddy_relay — thin launcher that finds a Python with pyserial and runs
+# buddy_relay.py. Lets users (and Claude Code hooks) point at one stable
+# path without worrying about Homebrew's PEP-668 lock on the system
+# Python. Honours BUDDY_PYTHON if set; otherwise probes a short list of
+# common locations (PlatformIO's bundled venv first — it ships with
+# pyserial — then the user's PlatformIO penv, then plain python3).
+set -euo pipefail
+
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+TARGET="$SCRIPT_DIR/buddy_relay.py"
+
+# Either transport library is enough — buddy_relay.py picks one at
+# runtime based on what it can import and what device it can reach.
+has_relay_lib() {
+  "$1" -c "import bleak" >/dev/null 2>&1 || "$1" -c "import serial" >/dev/null 2>&1
+}
+
+# Build candidate list. Globs may not match — `compgen -G` skips empties.
+CANDIDATES=()
+[[ -n "${BUDDY_PYTHON:-}" ]] && CANDIDATES+=("$BUDDY_PYTHON")
+while IFS= read -r p; do CANDIDATES+=("$p"); done < <(compgen -G "/opt/homebrew/Cellar/platformio/*/libexec/bin/python3" || true)
+[[ -x "$HOME/.platformio/penv/bin/python"  ]] && CANDIDATES+=("$HOME/.platformio/penv/bin/python")
+[[ -x "$HOME/.platformio/penv/bin/python3" ]] && CANDIDATES+=("$HOME/.platformio/penv/bin/python3")
+CANDIDATES+=("python3")
+
+for py in "${CANDIDATES[@]}"; do
+  if command -v "$py" >/dev/null 2>&1 && has_relay_lib "$py"; then
+    exec "$py" "$TARGET" "$@"
+  fi
+done
+
+cat >&2 <<'EOF'
+[buddy] No Python with bleak or pyserial found. Install at least one:
+  bleak  (BLE transport, recommended): pipx install bleak
+  pyserial (USB transport, fallback):  pipx install pyserial
+or point BUDDY_PYTHON at a Python interpreter that already has one:
+  BUDDY_PYTHON=$(which python3) tools/buddy_relay --tool Bash --hint test
+EOF
+exit 1

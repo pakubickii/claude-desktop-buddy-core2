@@ -67,10 +67,11 @@ inline const char* dataScenarioName() {
 static bool _rtcValid = false;
 inline bool dataRtcValid() { return _rtcValid; }
 
-static void _applyJson(const char* line, TamaState* out) {
+static void _applyJson(const char* line, TamaState* out, bool fromBle) {
+  Serial.printf("[rx%c] %s\n", fromBle ? 'B' : 'U', line);   // TEMP debug
   JsonDocument doc;
-  if (deserializeJson(doc, line)) return;
-  if (xferCommand(doc)) { _lastLiveMs = millis(); return; }
+  if (deserializeJson(doc, line)) { Serial.println("[rx] JSON parse FAIL"); return; }
+  if (xferCommand(doc)) { _lastLiveMs = millis(); Serial.println("[rx] -> xfer cmd"); return; }
 
   // Bridge sends {"time":[epoch_sec, tz_offset_sec]}; gmtime_r on the
   // adjusted epoch yields local components including weekday.
@@ -119,15 +120,35 @@ static void _applyJson(const char* line, TamaState* out) {
     }
     out->nLines = n;
   }
-  JsonObject pr = doc["prompt"];
-  if (!pr.isNull()) {
-    const char* pid = pr["id"]; const char* pt = pr["tool"]; const char* ph = pr["hint"];
-    strncpy(out->promptId,   pid ? pid : "", sizeof(out->promptId)-1);   out->promptId[sizeof(out->promptId)-1]=0;
-    strncpy(out->promptTool, pt  ? pt  : "", sizeof(out->promptTool)-1); out->promptTool[sizeof(out->promptTool)-1]=0;
-    strncpy(out->promptHint, ph  ? ph  : "", sizeof(out->promptHint)-1); out->promptHint[sizeof(out->promptHint)-1]=0;
-  } else {
-    out->promptId[0] = 0; out->promptTool[0] = 0; out->promptHint[0] = 0;
+  // Prompt-field handling. The cli/desktop transport mutex is enforced
+  // upstream (cli mode skips BLE init entirely; desktop mode gates USB
+  // input in dataPoll), so by the time we get here we already know the
+  // active transport gets to set/clear promptId. The remaining nuance:
+  //   - "prompt" key absent  -> leave promptId untouched (was a footgun;
+  //     status polls used to clear the approval out from under us)
+  //   - "prompt": null       -> clear (explicit signal)
+  //   - "prompt": { id... }  -> set
+  // Local clear after a tap (main.cpp loop) handles the post-decision
+  // wipe so we don't depend on an "absent prompt key" poll any more.
+  JsonObjectConst root = doc.as<JsonObjectConst>();
+  bool hasPromptKey = root.containsKey("prompt");
+  if (hasPromptKey) {
+    // ArduinoJson v7 quirk: `doc["prompt"].is<JsonObject>()` returns false
+    // even for a real object value because the JsonObject type is non-const
+    // and the variant is const here. Use the simpler "build a JsonObject and
+    // check isNull" idiom — null means either explicit JSON null or wrong
+    // type, both of which we treat as a clear request.
+    JsonObject pr = doc["prompt"];
+    if (!pr.isNull()) {
+      const char* pid = pr["id"]; const char* pt = pr["tool"]; const char* ph = pr["hint"];
+      strncpy(out->promptId,   pid ? pid : "", sizeof(out->promptId)-1);   out->promptId[sizeof(out->promptId)-1]=0;
+      strncpy(out->promptTool, pt  ? pt  : "", sizeof(out->promptTool)-1); out->promptTool[sizeof(out->promptTool)-1]=0;
+      strncpy(out->promptHint, ph  ? ph  : "", sizeof(out->promptHint)-1); out->promptHint[sizeof(out->promptHint)-1]=0;
+    } else {
+      out->promptId[0] = 0; out->promptTool[0] = 0; out->promptHint[0] = 0;
+    }
   }
+  (void)fromBle;   // kept for future per-transport routing, unused now
   out->lastUpdated = millis();
   _lastLiveMs = millis();
 }
@@ -136,11 +157,11 @@ template<size_t N>
 struct _LineBuf {
   char buf[N];
   uint16_t len = 0;
-  void feed(Stream& s, TamaState* out) {
+  void feed(Stream& s, TamaState* out, bool fromBle) {
     while (s.available()) {
       char c = s.read();
       if (c == '\n' || c == '\r') {
-        if (len > 0) { buf[len]=0; if (buf[0]=='{') _applyJson(buf, out); len=0; }
+        if (len > 0) { buf[len]=0; if (buf[0]=='{') _applyJson(buf, out, fromBle); len=0; }
       } else if (len < N-1) {
         buf[len++] = c;
       }
@@ -163,7 +184,12 @@ inline void dataPoll(TamaState* out) {
     return;
   }
 
-  _usbLine.feed(Serial, out);
+  // Mutual-exclusion mode: USB input is only processed in cli mode.
+  // Desktop mode keeps Serial as an output channel (boot log, [rx*]
+  // diagnostics) but ignores any JSON the host might write to it.
+  if (settings().inputMode == 1) {
+    _usbLine.feed(Serial, out, /*fromBle=*/false);
+  }
   // BLE ring buffer is drained manually since it's not a Stream.
   while (bleAvailable()) {
     int c = bleRead();
@@ -172,7 +198,7 @@ inline void dataPoll(TamaState* out) {
     if (c == '\n' || c == '\r') {
       if (_btLine.len > 0) {
         _btLine.buf[_btLine.len] = 0;
-        if (_btLine.buf[0] == '{') _applyJson(_btLine.buf, out);
+        if (_btLine.buf[0] == '{') _applyJson(_btLine.buf, out, /*fromBle=*/true);
         _btLine.len = 0;
       }
     } else if (_btLine.len < sizeof(_btLine.buf) - 1) {
