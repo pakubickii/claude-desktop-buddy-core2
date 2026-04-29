@@ -5,8 +5,11 @@
 // Each species file (src/buddies/<name>.cpp) includes this header
 // and defines its 7 state functions.
 
-// Geometry — shared layout for all species
-extern const int BUDDY_X_CENTER;
+// Geometry — shared layout for all species. X_CENTER is *mutable* so the
+// home screen can centre the pet (160) while the clock face puts it on
+// the left half (80) where the time can take the right half. Species
+// only ever read it, so dropping const is safe.
+extern int BUDDY_X_CENTER;
 extern const int BUDDY_CANVAS_W;
 extern const int BUDDY_Y_BASE;
 extern const int BUDDY_Y_OVERLAY;

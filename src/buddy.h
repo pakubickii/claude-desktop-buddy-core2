@@ -14,6 +14,11 @@ void buddySetSpecies(const char* name);
 void buddySetSpeciesIdx(uint8_t idx);
 void buddyNextSpecies();
 void buddySetPeek(bool peek);
+// Move the ASCII pet to a different x. 160 = centre of 320-wide screen
+// (home), 80 = left half (so the clock face owns the right half). No-op
+// when x already matches; bumps invalidation otherwise so the next tick
+// repaints from scratch.
+void buddySetXCenter(int x);
 uint8_t buddySpeciesIdx();
 uint8_t buddySpeciesCount();
 const char* buddySpeciesName();
