@@ -433,9 +433,10 @@ static void drawClock() {
 
   if (clockOrient == 0) {
     paintedOrient = 0;
-    // Core2 landscape: buddy lives in the left half (BUDDY_X_CENTER=80,
-    // see step 8b), clock lives in the right half. Clearing only the
-    // right half so the pet draw isn't fighting the clock's fillRect.
+    // Core2 landscape: clocking transition flipped buddy x-centre to 80
+    // (see loop()'s wasClocking handler) so the pet sits in the left
+    // half and the clock owns the right half. Clear only the right half
+    // — the pet's own tick repaints its strip.
     const int RX = W / 2;                 // 160 — right-half origin
     const int RCX = RX + (W - RX) / 2;    // 240 — right-half center
     spr.fillRect(RX, 0, W - RX, H, p.bg);
@@ -477,9 +478,9 @@ static void drawClock() {
     lastPetTick = millis();
     if (buddyMode) {
       // ASCII glyphs don't self-clear; wipe the box each tick. Species
-      // hardcode BUDDY_X_CENTER=67 / BUDDY_Y_OVERLAY=6 for particles so
-      // keep portrait coords and just swap the surface — pet lands
-      // upper-left of landscape, which is where we want it anyway.
+      // reference BUDDY_X_CENTER (flipped to 80 in clocking) and
+      // BUDDY_Y_OVERLAY for particles, so the pet lands upper-left of
+      // the landscape canvas — which is where we want it anyway.
       M5.Display.fillRect(0, 0, 115, 90, p.bg);
       buddyRenderTo(&M5.Display, activeState);
     } else {
@@ -905,6 +906,42 @@ void drawPet() {
   spr.printf("%u/%u", petPage + 1, PET_PAGES);
 }
 
+// Battery readout pinned to the top-right of the home screen. Charging
+// gets a "+" prefix; <=20% on battery flips to HOT to draw the eye. No
+// strip background or separator — the glyphs sit on whatever the pet
+// renderer left there (always blank at the top corner: pet body starts
+// at y=46 in scale 2). Skipped when a dedicated full-screen mode
+// (info/pet/clock/approval/passkey) or overlay (menu/settings/reset)
+// is up so we don't paint over their own headers.
+static void drawTopBar() {
+  const Palette& p = characterPalette();
+  spr.setTextSize(1);
+  int pct = M5.Power.getBatteryLevel();
+  if (pct < 0) return;
+  bool charging = M5.Power.isCharging();
+  char buf[10];
+  if (charging) snprintf(buf, sizeof(buf), "+%d%%", pct);
+  else          snprintf(buf, sizeof(buf), "%d%%",  pct);
+  uint16_t batColor = (pct <= 20 && !charging) ? HOT
+                     : charging               ? p.body
+                                              : p.text;
+  spr.setTextColor(batColor, p.bg);
+  int w = strlen(buf) * 6;   // 6 px/glyph at size 1
+  spr.setCursor(W - w - 4, 3);
+  spr.print(buf);
+}
+
+// HUD content goes stale after 60 s of no new transcript line and no msg
+// change. Without this the last command/status sat on screen forever,
+// long after it was useful — and with the bridge sending heartbeats
+// every few seconds, just hiding when "nothing arrived" doesn't work,
+// the heartbeat counts as activity. We instead track when the *content*
+// last changed (lineGen bump or tama.msg string change) and hide after
+// HUD_STALE_MS past that timestamp. User scrolling resets it.
+const uint32_t HUD_STALE_MS = 60000;
+static uint32_t hudLastChangeMs = 0;
+static char     hudLastMsg[24]  = "";
+
 void drawHUD() {
   if (tama.promptId[0]) { drawApproval(); return; }
   const Palette& p = characterPalette();
@@ -913,7 +950,21 @@ void drawHUD() {
   spr.fillRect(0, H - AREA, W, AREA, p.bg);
   spr.setTextSize(1);
 
-  if (tama.lineGen != lastLineGen) { msgScroll = 0; lastLineGen = tama.lineGen; wake(); }
+  uint32_t now = millis();
+  if (tama.lineGen != lastLineGen) {
+    msgScroll = 0; lastLineGen = tama.lineGen; wake();
+    hudLastChangeMs = now;
+  }
+  if (strcmp(tama.msg, hudLastMsg) != 0) {
+    strncpy(hudLastMsg, tama.msg, sizeof(hudLastMsg) - 1);
+    hudLastMsg[sizeof(hudLastMsg) - 1] = 0;
+    hudLastChangeMs = now;
+  }
+  if (msgScroll > 0) hudLastChangeMs = now;   // active scroll = active HUD
+
+  bool stale = hudLastChangeMs != 0
+            && (now - hudLastChangeMs) > HUD_STALE_MS;
+  if (stale) return;   // area was cleared above; nothing else to draw
 
   if (tama.nLines == 0) {
     spr.setTextColor(p.text, p.bg);
@@ -1212,6 +1263,11 @@ void loop() {
   if (clocking != wasClocking || landscapeClock != wasLandscape) {
     if (clocking && !landscapeClock) characterSetPeek(true);
     else applyDisplayMode();
+    // Pet sits centred (160) on the home screen; clock face needs the
+    // right half free, so push pet to the left half (80) whenever the
+    // clock is up — portrait *and* landscape (the landscape draw also
+    // hardcodes a left-side clear at x=0..115).
+    buddySetXCenter(clocking ? 80 : 160);
     characterInvalidate();
     if (buddyMode) buddyInvalidate();
     wasClocking = clocking;
@@ -1275,6 +1331,16 @@ void loop() {
     else if (displayMode == DISP_INFO) drawInfo();
     else if (displayMode == DISP_PET) drawPet();
     else if (settings().hud) drawHUD();
+    // Top status bar: only on the plain home screen. Approval, menus,
+    // info/pet pages, the clock face and the passkey screen have their
+    // own headers — painting the bar over them just clobbers their
+    // titles. Drawn last so transient pet repaints (which clear y=0..)
+    // don't wipe it.
+    bool homeScreen = displayMode == DISP_NORMAL
+                   && !tama.promptId[0]
+                   && !menuOpen && !settingsOpen && !resetOpen
+                   && !blePasskey() && !clocking;
+    if (homeScreen) drawTopBar();
     if (resetOpen) drawReset();
     else if (settingsOpen) drawSettings();
     else if (menuOpen) drawMenu();
