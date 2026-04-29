@@ -183,11 +183,12 @@ struct Settings {
   bool wifi;     // placeholder — no WiFi stack linked yet, just stores the pref
   bool led;
   bool hud;
+  bool quotes;   // speech-bubble quotes (local pool + optional bridge LLM pushes)
   uint8_t clockRot;  // 0=auto 1=portrait 2=landscape
   uint8_t inputMode; // 0=desktop (BLE owns prompts), 1=cli (USB-serial owns prompts)
 };
 
-static Settings _settings = { true, true, true, false, true, true, 0, 0 };
+static Settings _settings = { true, true, true, false, true, true, true, 0, 0 };
 
 inline void settingsLoad() {
   _prefs.begin("buddy", true);
@@ -197,6 +198,7 @@ inline void settingsLoad() {
   _settings.wifi  = _prefs.getBool("s_wifi",false);
   _settings.led   = _prefs.getBool("s_led", true);
   _settings.hud      = _prefs.getBool("s_hud", true);
+  _settings.quotes   = _prefs.getBool("s_qts", true);
   _settings.clockRot = _prefs.getUChar("s_crot", 0);
   if (_settings.clockRot > 2) _settings.clockRot = 0;
   _settings.inputMode = _prefs.getUChar("s_imode", 0);
@@ -212,6 +214,7 @@ inline void settingsSave() {
   _prefs.putBool("s_wifi",_settings.wifi);
   _prefs.putBool("s_led", _settings.led);
   _prefs.putBool("s_hud", _settings.hud);
+  _prefs.putBool("s_qts", _settings.quotes);
   _prefs.putUChar("s_crot", _settings.clockRot);
   _prefs.putUChar("s_imode", _settings.inputMode);
   _prefs.end();

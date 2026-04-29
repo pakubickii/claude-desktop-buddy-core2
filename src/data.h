@@ -19,6 +19,12 @@ struct TamaState {
   char     promptId[40];     // pending permission request ID; empty = no prompt
   char     promptTool[20];
   char     promptHint[44];
+  // Bridge-pushed speech-bubble quote. quoteAtMs is millis() at receive
+  // time; the firmware compares against its own "last consumed" cursor
+  // to detect a fresh arrival without needing the bridge to clear the
+  // field. Empty quote string + quoteAtMs=0 = no bridge quote yet.
+  char     quote[64];
+  uint32_t quoteAtMs;
 };
 
 // ---------------------------------------------------------------------------
@@ -95,6 +101,17 @@ static void _applyJson(const char* line, TamaState* out, bool fromBle) {
     _rtcValid = true;
     _lastLiveMs = millis();
     return;
+  }
+
+  // Speech-bubble quote: bridge sends {"quote":"..."} (typically
+  // standalone, but it'll happily ride along inside a status frame).
+  // We bump quoteAtMs so the firmware-side picker can detect a fresh
+  // arrival regardless of whether the same text was already on screen.
+  const char* qt = doc["quote"];
+  if (qt && qt[0]) {
+    strncpy(out->quote, qt, sizeof(out->quote) - 1);
+    out->quote[sizeof(out->quote) - 1] = 0;
+    out->quoteAtMs = millis();
   }
 
   out->sessionsTotal     = doc["total"]     | out->sessionsTotal;
